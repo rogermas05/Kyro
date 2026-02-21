@@ -57,6 +57,124 @@ SimpleSmartAccount    — ERC-4337 smart account for gas-abstracted SME onboardi
 
 ---
 
+## Account Abstraction & Gas Sponsorship
+
+Kyro ships a complete, reusable ERC-4337 gas sponsorship toolkit compatible with **EntryPoint v0.7**. Any dApp building on ADI Chain can extract and reuse this stack independently of the trade finance protocol.
+
+### Contracts
+
+| Contract | Description |
+|---|---|
+| `SimpleSmartAccount` | ECDSA-validated ERC-4337 smart account |
+| `SimpleSmartAccountFactory` | Deploys accounts deterministically via CREATE2 |
+| `SignaturePaymaster` | Sponsors gas in **native tokens** — zero cost to the user |
+| `ERC20TokenPaymaster` | Sponsors gas in native, collects payment in **ERC-20** (e.g. DDSC) |
+| `MinimalEntryPoint` | EntryPoint v0.7-compatible — for testnet and development |
+
+### Sponsorship Model
+
+Authorization is **backend-controlled via ECDSA signature** — not tied to `msg.sender` or bundler identity.
+
+**Three-party flow:**
+
+```
+1. User signs the UserOperation with their EOA key
+       │
+       ▼
+2. Frontend sends UserOp to POST /api/sponsor
+   → Backend sponsor service signs a hash of the UserOp
+   → Returns paymasterAndData (paymaster address + time window + ECDSA sig)
+       │
+       ▼
+3. Frontend adds paymasterAndData to the UserOp, then calls POST /api/relay
+   → Backend submits handleOps() to EntryPoint
+   → EntryPoint calls validatePaymasterUserOp(), verifies sponsor signature
+   → If valid: paymaster covers gas, UserOp executes
+```
+
+**What the sponsor signature is bound to** (all fields included in the signed hash):
+
+- Smart account address (`userOp.sender`)
+- Full UserOp fields: `nonce`, `initCode`, `callData`, `gasLimits`, `gasFees`
+- `block.chainid`
+- `entryPoint` address
+- `address(this)` (paymaster address)
+- `validUntil` and `validAfter` (5-minute validity window by default)
+
+For the ERC-20 paymaster the hash additionally covers `maxTokenCost`, preventing replay across different pricing contexts.
+
+### Security Assumptions
+
+- **Sponsor private key** is held exclusively by the backend (`SPONSOR_PRIVATE_KEY` env var). Compromise of this key allows an attacker to generate valid sponsorships — rotate immediately if leaked.
+- **Validity windows** limit replay exposure. Each sponsorship is valid for a fixed time window; expired signatures are rejected by the EntryPoint.
+- **Signature scope** binds the sponsorship to one specific UserOp. Changing any field (callData, gas limits, nonce) invalidates the sponsorship.
+- **ERC-20 allowance** — the ERC-20 paymaster checks balance and allowance in `validatePaymasterUserOp` and deducts in `postOp`. If the account's ERC-20 balance drops between validation and post-op, the transaction reverts.
+- `MinimalEntryPoint` is **not audited** and intended for testnet only. For mainnet use the official [eth-infinitism/account-abstraction v0.7](https://github.com/eth-infinitism/account-abstraction) EntryPoint.
+
+### Reusing This Stack in Your dApp
+
+**Step 1 — Deploy paymasters**
+
+```bash
+cd packages/foundry
+
+# Set env vars
+export SPONSOR_SIGNER_ADDRESS=<your-backend-signer-address>
+export DDSC_ADDRESS=<erc20-token-address>          # for ERC-20 paymaster
+export PAYMASTER_DEPOSIT_ETH=0.1                   # native pre-deposit
+export ERC20_EXCHANGE_RATE=3600000000000000000000  # 3600 tokens per 1 native
+
+forge script script/04_DeployAA.s.sol --rpc-url $RPC_URL --broadcast
+```
+
+Output includes all four contract addresses — copy them to your `.env`.
+
+**Step 2 — Run the sponsor API**
+
+Set `SPONSOR_PRIVATE_KEY` in your backend environment. The `/api/sponsor` route in `packages/nextjs/app/api/sponsor/route.ts` is self-contained and can be copied into any Next.js or Express app.
+
+**Step 3 — Generate sponsored transactions**
+
+Use the `sendSponsoredUserOp()` helper from `packages/nextjs/lib/smart-account.ts`:
+
+```typescript
+import { sendSponsoredUserOp } from '@/lib/smart-account'
+
+// Encode any contract call
+const callData = encodeFunctionData({ abi, functionName: 'myFunction', args: [...] })
+
+// One call handles: build UserOp → get sponsorship → sign → relay
+const txHash = await sendSponsoredUserOp(publicClient, walletClient, smartAccountAddress, callData)
+```
+
+The user signs once (no gas cost). The backend handles sponsorship and submission.
+
+### Running the E2E Demos
+
+Two Foundry scripts demonstrate both flows on testnet with full balance delta output:
+
+```bash
+# Flow A: counterfactual account, zero native balance, native-token sponsorship
+forge script script/E2E_NativeSponsorship.s.sol --rpc-url $RPC_URL --broadcast
+
+# Flow B: account with ERC-20 only, gas paid by paymaster in native, ERC-20 deducted
+forge script script/E2E_ERC20Sponsorship.s.sol --rpc-url $RPC_URL --broadcast
+```
+
+Each script outputs: transaction hash, smart account address, and paymaster balance deltas (before/after/delta).
+
+### Tested Failure Cases
+
+| Case | Test |
+|---|---|
+| Invalid sponsor signature | `SignaturePaymaster.t.sol::test_InvalidSponsorSigRejected` |
+| Expired sponsorship (`validUntil` in past) | `SignaturePaymaster.t.sol::test_ExpiredSponsorshipRejected` |
+| Not-yet-valid sponsorship (`validAfter` in future) | `SignaturePaymaster.t.sol::test_FutureSponsorshipRejected` |
+| Underfunded ERC-20 balance | `ERC20TokenPaymaster.t.sol::test_UnderfundedERC20_Reverts` |
+| Insufficient ERC-20 allowance | `ERC20TokenPaymaster.t.sol::test_InsufficientAllowance_Reverts` |
+
+---
+
 ## Portals
 
 | Portal | Who | What |

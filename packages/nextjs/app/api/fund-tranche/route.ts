@@ -84,7 +84,7 @@ export async function POST(req: NextRequest) {
     args:         [invoiceId as `0x${string}`],
   })
 
-  const [, seniorAmt,, purchased, settled] = rec
+  const [smeAddr, seniorAmt, juniorAmt, purchased, settled] = rec
   if (purchased) return NextResponse.json({ error: 'Senior tranche already purchased' }, { status: 400 })
   if (settled)   return NextResponse.json({ error: 'Invoice already settled'           }, { status: 400 })
 
@@ -120,6 +120,17 @@ export async function POST(req: NextRequest) {
   const receipt = await pub.waitForTransactionReceipt({ hash })
   if (receipt.status === 'reverted') {
     return NextResponse.json({ error: 'purchaseSeniorTranche transaction reverted — check roles and vault balance' }, { status: 500 })
+  }
+
+  // Mint juniorAmount DDSC to the SME so they have the full faceValue to settle (demo only)
+  if (juniorAmt > 0n) {
+    const juniorMintHash = await wc.writeContract({
+      address:      ddscAddr as `0x${string}`,
+      abi:          DDSC_ABI,
+      functionName: 'mint',
+      args:         [smeAddr, juniorAmt],
+    })
+    await pub.waitForTransactionReceipt({ hash: juniorMintHash })
   }
 
   return NextResponse.json({ hash, seniorAmount: seniorAmt.toString() })

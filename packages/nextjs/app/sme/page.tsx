@@ -520,6 +520,16 @@ export default function SMEPage() {
       const useAA = smartAccount && ENTRY_POINT !== '0x0000000000000000000000000000000000000000'
 
       if (useAA) {
+        // Ensure smart account has enough DDSC to repay (demo: top up if short)
+        const smaBal = await pub.readContract({ address: DDSC_ADDR, abi: ERC20_ABI, functionName: 'balanceOf', args: [smartAccount!] })
+        if (smaBal < faceValue) {
+          await fetch('/api/mint-ddsc', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ address: smartAccount, amount: formatUnits(faceValue - smaBal, 18) }),
+          })
+        }
+
         setStatus({ msg: 'Building sponsored DDSC transfer…', type: 'info' })
         const transferData = encodeFunctionData({
           abi: ERC20_ABI,
@@ -531,6 +541,16 @@ export default function SMEPage() {
         const receipt = await pub.waitForTransactionReceipt({ hash: txHash })
         if (receipt.status === 'reverted') throw new Error('DDSC transfer reverted — check your balance')
       } else {
+        // Ensure EOA has enough DDSC to repay (demo: top up if short)
+        const eoaBal = await pub.readContract({ address: DDSC_ADDR, abi: ERC20_ABI, functionName: 'balanceOf', args: [account as `0x${string}`] })
+        if (eoaBal < faceValue) {
+          await fetch('/api/mint-ddsc', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ address: account, amount: formatUnits(faceValue - eoaBal, 18) }),
+          })
+        }
+
         setStatus({ msg: 'Waiting for wallet — transfer DDSC to orchestrator…', type: 'info' })
         const transferHash = await walletClient.writeContract({
           address: DDSC_ADDR,
