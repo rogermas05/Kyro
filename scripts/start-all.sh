@@ -81,12 +81,16 @@ run_phase "Phase 06 — Configure"        "script/06_Configure.s.sol"
 # ── 3. Write frontend .env.local ─────────────────────────────────────────────
 ENV_FILE="$ROOT/packages/nextjs/.env.local"
 cat > "$ENV_FILE" <<EOF
+NEXT_PUBLIC_USE_LOCAL=true
 NEXT_PUBLIC_ORCHESTRATOR_ADDRESS=$ORCHESTRATOR_ADDRESS
 NEXT_PUBLIC_VAULT_ADDRESS=$VAULT_ADDRESS
 NEXT_PUBLIC_DDSC_ADDRESS=$DDSC_ADDRESS
 NEXT_PUBLIC_MADI_ADDRESS=$MADI_ADDRESS
 NEXT_PUBLIC_ORACLE_ADDRESS=$PRICE_ORACLE_ADDRESS
 NEXT_PUBLIC_ROUTER_ADDRESS=$PAY_ROUTER_ADDRESS
+ORACLE_PRIVATE_KEY=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a
+FAUCET_PRIVATE_KEY=$PRIVATE_KEY
+IDENTITY_REGISTRY_ADDRESS=$IDENTITY_REGISTRY_ADDRESS
 EOF
 echo ""
 echo "Written $ENV_FILE"

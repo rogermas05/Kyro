@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import { FaucetButton } from './components/FaucetButton'
 
 export const metadata: Metadata = {
   title: 'Kyro — Invoice Finance, On-Chain',
@@ -7,6 +8,8 @@ export const metadata: Metadata = {
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  const isLocal = process.env.NEXT_PUBLIC_USE_LOCAL === 'true'
+
   return (
     <html lang="en">
       <body>
@@ -18,6 +21,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <a href="/investor">Investor</a>
           <a href="/auditor">Auditor</a>
           <a href="/merchant">Merchant</a>
+          {isLocal && <FaucetButton />}
         </nav>
         <main>{children}</main>
       </body>

@@ -42,6 +42,20 @@ export const ORCHESTRATOR_ABI = [
       { name: 'recoveredAmount', type: 'uint256', indexed: false },
     ],
   },
+  {
+    // Auto-generated getter for the `invoices` public mapping
+    name: 'invoices',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'invoiceId', type: 'bytes32' }],
+    outputs: [
+      { name: 'sme',             type: 'address' },
+      { name: 'seniorAmount',    type: 'uint256' },
+      { name: 'juniorAmount',    type: 'uint256' },
+      { name: 'seniorPurchased', type: 'bool'    },
+      { name: 'settled',         type: 'bool'    },
+    ],
+  },
 ] as const
 
 export const VAULT_ABI = [
@@ -119,6 +133,16 @@ export const ORACLE_ABI = [
       { name: 'token',      type: 'address' },
     ],
     outputs: [{ name: '', type: 'uint256' }],
+  },
+] as const
+
+export const IDENTITY_REGISTRY_ABI = [
+  {
+    name: 'isVerified',
+    type: 'function',
+    stateMutability: 'view',
+    inputs: [{ name: 'wallet', type: 'address' }],
+    outputs: [{ name: '', type: 'bool' }],
   },
 ] as const
 
