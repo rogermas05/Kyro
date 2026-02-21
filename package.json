@@ -8,8 +8,8 @@
     "packages/checkout-widget"
   ],
   "scripts": {
-    "build": "yarn workspace nextjs build",
-    "start": "yarn workspace nextjs dev",
+    "build": "yarn workspace @adi/nextjs build",
+    "start": "yarn workspace @adi/nextjs dev",
     "deploy:identity": "cd packages/foundry && forge script script/01_DeployIdentity.s.sol --rpc-url $ADI_RPC_URL --broadcast",
     "deploy:asset": "cd packages/foundry && forge script script/02_DeployAssetLayer.s.sol --rpc-url $ADI_RPC_URL --broadcast",
     "deploy:vault": "cd packages/foundry && forge script script/03_DeployVault.s.sol --rpc-url $ADI_RPC_URL --broadcast",

@@ -234,6 +234,7 @@ export async function submitUserOp(
   const accounts = await walletClient.getAddresses()
   return walletClient.writeContract({
     account: accounts[0],
+    chain: null,
     address: ENTRY_POINT,
     abi: ENTRY_POINT_ABI,
     functionName: 'handleOps',
