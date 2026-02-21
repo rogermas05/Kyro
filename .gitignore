@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Next.js build output
+packages/nextjs/.next/
+packages/nextjs/out/
+
+# Foundry artifacts
+packages/foundry/out/
+packages/foundry/cache/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo

@@ -1,0 +1,23 @@
+{
+  "name": "adi-trade-finance-vault",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "packages/nextjs",
+    "packages/sdk",
+    "packages/checkout-widget"
+  ],
+  "scripts": {
+    "build": "yarn workspace nextjs build",
+    "start": "yarn workspace nextjs dev",
+    "deploy:identity": "cd packages/foundry && forge script script/01_DeployIdentity.s.sol --rpc-url $ADI_RPC_URL --broadcast",
+    "deploy:asset": "cd packages/foundry && forge script script/02_DeployAssetLayer.s.sol --rpc-url $ADI_RPC_URL --broadcast",
+    "deploy:vault": "cd packages/foundry && forge script script/03_DeployVault.s.sol --rpc-url $ADI_RPC_URL --broadcast",
+    "deploy:aa": "cd packages/foundry && forge script script/04_DeployAA.s.sol --rpc-url $ADI_RPC_URL --broadcast",
+    "deploy:merchant": "cd packages/foundry && forge script script/05_DeployMerchant.s.sol --rpc-url $ADI_RPC_URL --broadcast",
+    "deploy:configure": "cd packages/foundry && forge script script/06_Configure.s.sol --rpc-url $ADI_RPC_URL --broadcast",
+    "test": "cd packages/foundry && forge test -vvv",
+    "build:sdk": "yarn workspace sdk build",
+    "build:widget": "yarn workspace checkout-widget build"
+  }
+}
