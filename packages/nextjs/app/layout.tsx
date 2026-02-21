@@ -1,6 +1,10 @@
 import type { Metadata } from 'next'
+import Link from 'next/link'
 import './globals.css'
 import { FaucetButton } from './components/FaucetButton'
+import { NavLinks } from './components/NavLinks'
+import { WalletProvider } from './context/WalletContext'
+import { WalletButton } from './components/WalletButton'
 
 export const metadata: Metadata = {
   title: 'Kyro — Invoice Finance, On-Chain',
@@ -13,17 +17,17 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
   return (
     <html lang="en">
       <body>
-        <nav>
-          <a href="/" className="brand">
-            <em>Kyro</em>
-          </a>
-          <a href="/sme">SME</a>
-          <a href="/investor">Investor</a>
-          <a href="/auditor">Auditor</a>
-          <a href="/merchant">Merchant</a>
-          {isLocal && <FaucetButton />}
-        </nav>
-        <main>{children}</main>
+        <WalletProvider>
+          <nav>
+            <Link href="/" className="brand">
+              <em>Kyro</em>
+            </Link>
+            <NavLinks />
+            {isLocal && <FaucetButton />}
+            <WalletButton />
+          </nav>
+          <main>{children}</main>
+        </WalletProvider>
       </body>
     </html>
   )

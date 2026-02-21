@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import { formatUnits } from 'viem'
 import { getPublicClient } from '../../lib/wallet'
 import { ORCHESTRATOR_ABI } from '../../lib/abis'
@@ -21,6 +21,8 @@ export default function AuditorPage() {
   const [loading, setLoading] = useState(false)
   const [fetched, setFetched] = useState(false)
   const [error, setError]     = useState('')
+
+  useEffect(() => { fetchEvents() }, [])
 
   async function fetchEvents() {
     if (ORCHESTRATOR === ZERO) {
@@ -141,55 +143,73 @@ export default function AuditorPage() {
           </p>
         )}
 
+        {/* Timeline */}
         {rows.length > 0 && (
-          <div style={{ overflowX: 'auto', marginTop: '1.25rem' }}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Event</th>
-                  <th>Invoice ID</th>
-                  <th>Block</th>
-                  <th>Details</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r, i) => (
-                  <tr key={i}>
-                    <td>
-                      <span className={badgeClass[r.kind]}>
-                        {r.kind.replace('Invoice', '')}
-                      </span>
-                    </td>
-                    <td>
-                      <span className="mono" style={{ fontSize: '0.78rem' }}>{r.invoiceId}</span>
-                    </td>
-                    <td>
-                      <span className="mono" style={{ fontSize: '0.78rem' }}>{r.block.toString()}</span>
-                    </td>
-                    <td style={{ fontSize: '0.82rem' }}>{r.extra}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+          <div style={{ marginTop: '1.5rem', position: 'relative' }}>
+            {/* Vertical line */}
+            <div style={{
+              position: 'absolute', left: 19, top: 0, bottom: 0,
+              width: 2,
+              background: 'linear-gradient(180deg, rgba(0,53,95,0.8) 0%, rgba(0,53,95,0.1) 100%)',
+            }} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
+              {rows.map((r, i) => {
+                const dotColor =
+                  r.kind === 'InvoiceMinted'    ? 'var(--orange)' :
+                  r.kind === 'InvoiceSettled'   ? 'var(--success)' :
+                  '#e05c5c'
+                const icon =
+                  r.kind === 'InvoiceMinted'    ? '◆' :
+                  r.kind === 'InvoiceSettled'   ? '✓' :
+                  '✕'
+                return (
+                  <div key={i} style={{ display: 'flex', gap: '1rem', alignItems: 'flex-start', paddingBottom: '1.25rem' }}>
+                    {/* Dot */}
+                    <div style={{
+                      width: 38, height: 38, borderRadius: '50%', flexShrink: 0,
+                      display: 'flex', alignItems: 'center', justifyContent: 'center',
+                      background: dotColor + '18',
+                      border: `2px solid ${dotColor}`,
+                      color: dotColor,
+                      fontSize: '0.75rem',
+                      fontWeight: 700,
+                      zIndex: 1,
+                    }}>
+                      {icon}
+                    </div>
+                    {/* Content */}
+                    <div style={{
+                      flex: 1,
+                      background: 'rgba(0,0,0,0.18)',
+                      border: `1px solid ${dotColor}22`,
+                      borderRadius: 8,
+                      padding: '0.65rem 0.9rem',
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.3rem', flexWrap: 'wrap' }}>
+                        <span className={badgeClass[r.kind]} style={{ fontSize: '0.62rem' }}>
+                          {r.kind.replace('Invoice', '')}
+                        </span>
+                        <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.72rem', color: 'var(--muted)' }}>
+                          {r.invoiceId}
+                        </span>
+                        <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.65rem', color: 'rgba(255,255,255,0.2)', marginLeft: 'auto' }}>
+                          block {r.block.toString()}
+                        </span>
+                      </div>
+                      <p style={{ fontSize: '0.82rem', color: 'var(--text-2)', margin: 0 }}>{r.extra}</p>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           </div>
         )}
 
-        {/* Empty state before fetch */}
-        {!fetched && !loading && (
-          <div style={{
-            marginTop: '2rem', padding: '3rem',
-            display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '1rem',
-            background: 'rgba(0,0,0,0.2)', borderRadius: 12,
-            border: '1px dashed var(--border-sub)',
-          }}>
-            <svg width="40" height="40" viewBox="0 0 40 40" fill="none">
-              <circle cx="20" cy="20" r="18" stroke="rgba(0,53,95,0.8)" strokeWidth="1.5"/>
-              <path d="M20 12v10l5 5" stroke="#f47820" strokeWidth="1.5" strokeLinecap="round"/>
-            </svg>
-            <p style={{ fontSize: '0.88rem', color: 'var(--muted)', textAlign: 'center' }}>
-              Click "Fetch Events" to scan the last 10,000 blocks for invoice lifecycle events.
-            </p>
-          </div>
+        {/* Loading state */}
+        {loading && (
+          <p style={{ marginTop: '1.5rem', color: 'var(--muted)', fontSize: '0.88rem', fontFamily: 'JetBrains Mono, monospace' }}>
+            Scanning chain for events…
+          </p>
         )}
       </div>
 

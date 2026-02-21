@@ -1,9 +1,11 @@
+import { ProtocolStats } from './components/ProtocolStats'
+
 const PORTALS = [
   {
     num: '01',
     label: 'SME Portal',
-    title: 'Tokenize Trade Invoices',
-    desc: 'Upload oracle-attested invoices and convert them into on-chain RWA tokens. Receive instant DDSC liquidity against your senior tranche.',
+    title: 'Get Cash From Your Invoices',
+    desc: 'Upload an invoice, get it oracle-verified, and receive DDSC stablecoin to your wallet immediately. No waiting 30–90 days for the buyer to pay. No bank required.',
     href: '/sme',
     icon: (
       <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
@@ -17,8 +19,8 @@ const PORTALS = [
   {
     num: '02',
     label: 'Investor Portal',
-    title: 'Earn Yield on DDSC',
-    desc: 'Deposit DDSC into the ERC-4626 Trade Finance Vault. Earn real yield as SME invoices are settled — principal protected by senior tranche priority.',
+    title: 'Earn Real-World Yield',
+    desc: 'Deposit DDSC into the trade finance vault and earn yield as invoices are repaid by real buyers. Your returns are backed by real commerce — not speculation.',
     href: '/investor',
     icon: (
       <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
@@ -29,24 +31,9 @@ const PORTALS = [
   },
   {
     num: '03',
-    label: 'Merchant Portal',
-    title: 'Accept Any Token',
-    desc: 'Configure KyroPay for your storefront. Customers pay in mADI or DDSC — the on-chain swap router delivers your preferred token automatically.',
-    href: '/merchant',
-    icon: (
-      <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
-        <rect x="4" y="10" width="24" height="16" rx="3" stroke="#f47820" strokeWidth="1.5" fill="none"/>
-        <path d="M4 16h24" stroke="#f47820" strokeWidth="1.5" opacity="0.5"/>
-        <rect x="8" y="20" width="6" height="2" rx="1" fill="#f47820" opacity="0.5"/>
-        <path d="M10 10V7a6 6 0 0 1 12 0v3" stroke="#f47820" strokeWidth="1.5" strokeLinecap="round" fill="none"/>
-      </svg>
-    ),
-  },
-  {
-    num: '04',
     label: 'Auditor Portal',
     title: 'Track Compliance On-Chain',
-    desc: 'Real-time event log for every invoice lifecycle event. InvoiceMinted, InvoiceSettled, InvoiceDefaulted — all verifiable on ADI Chain.',
+    desc: 'A live, immutable log of every invoice — from creation to settlement. Full on-chain transparency for compliance teams, verifiable by anyone.',
     href: '/auditor',
     icon: (
       <svg width="32" height="32" viewBox="0 0 32 32" fill="none">
@@ -61,12 +48,12 @@ const STEPS = [
   {
     n: '1',
     title: 'Originate',
-    desc: 'SME submits invoice details. Off-chain oracle signs a ZK attestation of invoice validity — no sensitive data on-chain.',
+    desc: 'SME submits invoice details and uploads the document. An off-chain oracle attests to the invoice — in production it checks buyer creditworthiness and trade records before signing. Only a document hash goes on-chain; the file stays private.',
   },
   {
     n: '2',
     title: 'Tokenize & Fund',
-    desc: 'InvoiceOrchestrator mints NFT. 80% senior tranche enters the vault; SME receives DDSC immediately against that collateral.',
+    desc: 'Your verified invoice becomes an on-chain NFT. 80% of the face value flows into the vault as collateral — and you receive DDSC to your wallet instantly. No banks. No delays.',
   },
   {
     n: '3',
@@ -79,17 +66,44 @@ export default function HomePage() {
   return (
     <div style={{ paddingTop: 'var(--nav-h)' }}>
 
-      {/* ── Hero ───────────────────────────────────────────────── */}
+      {/* ── Hero + Stats (full viewport) ───────────────────────── */}
+      <div style={{ height: 'calc(100vh - var(--nav-h))', display: 'flex', flexDirection: 'column' }}>
       <section style={{
-        minHeight: 'calc(100vh - var(--nav-h))',
+        flex: 1,
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'center',
         maxWidth: 1080,
         margin: '0 auto',
-        padding: '5rem 2rem 4rem',
+        width: '100%',
+        padding: '4rem 2rem 3rem',
+        position: 'relative',
+        overflow: 'hidden',
       }}>
-        <div className="eyebrow fade-up" style={{ marginBottom: '1.75rem' }}>
+        {/* Floating gradient orb */}
+        <div className="float" style={{
+          position: 'absolute',
+          top: '8%', left: '-10%',
+          width: 600, height: 600,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(244,120,32,0.09) 0%, rgba(0,53,95,0.12) 50%, transparent 70%)',
+          pointerEvents: 'none',
+          zIndex: 0,
+          animationDuration: '7s',
+        }} />
+        <div className="float" style={{
+          position: 'absolute',
+          bottom: '5%', right: '-5%',
+          width: 400, height: 400,
+          borderRadius: '50%',
+          background: 'radial-gradient(circle, rgba(0,53,95,0.2) 0%, transparent 65%)',
+          pointerEvents: 'none',
+          zIndex: 0,
+          animationDuration: '9s',
+          animationDelay: '-3s',
+        }} />
+
+        <div className="eyebrow fade-up" style={{ marginBottom: '1.75rem', position: 'relative', zIndex: 1 }}>
           Real-World Assets · ADI Chain · kyro.cash
         </div>
 
@@ -101,10 +115,11 @@ export default function HomePage() {
           maxWidth: 720,
           marginBottom: '1.75rem',
           letterSpacing: '-0.02em',
+          position: 'relative', zIndex: 1,
         }}>
           Invoice Finance,<br />
-          <em style={{ color: 'var(--orange)', fontStyle: 'italic' }}>On-Chain.</em><br />
-          <span style={{ color: 'var(--text-2)', fontWeight: 400 }}>Liquid. Compliant.</span>
+          <em className="glow-pulse" style={{ color: 'var(--orange)', fontStyle: 'italic' }}>Reimagined.</em><br />
+          <span style={{ color: 'var(--text-2)', fontWeight: 400 }}>Liquid. Yielding.</span>
         </h1>
 
         <p className="fade-up-2" style={{
@@ -113,13 +128,14 @@ export default function HomePage() {
           lineHeight: 1.8,
           maxWidth: 520,
           marginBottom: '2.75rem',
+          position: 'relative', zIndex: 1,
         }}>
-          Kyro is an institutional-grade RWA credit engine on ADI Chain. Tokenize trade
-          invoices into compliant, liquid instruments — ZK-verified, ERC-4626 vault-backed,
-          with Account Abstraction for seamless UX.
+          SMEs upload their outstanding invoices and receive DDSC stablecoin immediately —
+          no 30-day wait, no banks. Investors earn real yield as those invoices are repaid
+          by buyers. Every step is transparent and verifiable on ADI Chain.
         </p>
 
-        <div className="fade-up-3" style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginBottom: '3.5rem' }}>
+        <div className="fade-up-3" style={{ display: 'flex', gap: '1rem', flexWrap: 'wrap', marginBottom: '3.5rem', position: 'relative', zIndex: 1 }}>
           <a href="/investor" className="btn btn-primary" style={{ width: 'auto', margin: 0 }}>
             Investor Portal
           </a>
@@ -129,7 +145,7 @@ export default function HomePage() {
         </div>
 
         {/* Tech stack badges */}
-        <div className="fade-up-4" style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap' }}>
+        <div className="fade-up-4" style={{ display: 'flex', gap: '0.6rem', flexWrap: 'wrap', position: 'relative', zIndex: 1 }}>
           {['ERC-4626', 'ERC-721', 'ERC-3643', 'ERC-4337', 'ZK Attestation', 'DDSC'].map(tag => (
             <span key={tag} style={{
               fontFamily: 'JetBrains Mono, monospace',
@@ -144,6 +160,8 @@ export default function HomePage() {
           ))}
         </div>
       </section>
+      <ProtocolStats />
+      </div>
 
       <div className="divider" />
 
@@ -157,10 +175,10 @@ export default function HomePage() {
             fontWeight: 600,
             marginTop: '0.5rem',
           }}>
-            Four roles. One protocol.
+            Three roles. One protocol.
           </h2>
           <p style={{ color: 'var(--text-2)', marginTop: '0.75rem', fontSize: '0.95rem' }}>
-            Each actor in the trade finance lifecycle has a dedicated portal.
+            From invoice upload to yield withdrawal — every role has a dedicated portal.
           </p>
         </div>
 
@@ -169,52 +187,52 @@ export default function HomePage() {
           gridTemplateColumns: 'repeat(auto-fill, minmax(240px, 1fr))',
           gap: '1.25rem',
         }}>
-          {PORTALS.map((p) => (
-            <a
-              key={p.href}
-              href={p.href}
-              style={{ textDecoration: 'none', display: 'block' }}
-            >
-              <div className="card" style={{ height: '100%', position: 'relative', overflow: 'hidden', cursor: 'pointer' }}>
-                {/* Background number */}
+          {PORTALS.map((p) => {
+            const featured = p.href === '/sme' || p.href === '/investor'
+            return (
+            <a key={p.href} href={p.href} style={{ textDecoration: 'none', display: 'block' }}>
+              <div className="card" style={{
+                height: '100%', position: 'relative', overflow: 'hidden', cursor: 'pointer',
+                ...(featured ? {
+                  borderColor: 'rgba(244,120,32,0.22)',
+                  background: 'linear-gradient(135deg, rgba(0,53,95,0.45) 0%, rgba(0,30,50,0.5) 100%)',
+                } : { opacity: 0.75 }),
+              }}>
                 <div style={{
                   position: 'absolute', top: '1rem', right: '1.25rem',
                   fontFamily: 'JetBrains Mono, monospace',
                   fontSize: '3rem', fontWeight: 500,
-                  color: 'rgba(244,120,32,0.06)',
+                  color: featured ? 'rgba(244,120,32,0.09)' : 'rgba(244,120,32,0.05)',
                   lineHeight: 1, userSelect: 'none',
                 }}>
                   {p.num}
                 </div>
-
+                {featured && (
+                  <div style={{
+                    position: 'absolute', top: '0.85rem', left: 0,
+                    width: 3, height: '55%', borderRadius: '0 2px 2px 0',
+                    background: 'linear-gradient(180deg, var(--orange) 0%, transparent 100%)',
+                  }} />
+                )}
                 <div style={{ marginBottom: '1.25rem' }}>{p.icon}</div>
                 <h3 style={{ marginBottom: '0.3rem' }}>{p.label}</h3>
                 <div style={{
                   fontFamily: 'Cormorant Garamond, serif',
-                  fontSize: '1.25rem',
-                  fontWeight: 600,
-                  color: 'var(--text)',
-                  marginBottom: '0.85rem',
-                  lineHeight: 1.3,
-                }}>
-                  {p.title}
-                </div>
-                <p style={{ fontSize: '0.87rem', color: 'var(--text-2)', lineHeight: 1.65 }}>
-                  {p.desc}
-                </p>
+                  fontSize: '1.25rem', fontWeight: 600,
+                  color: 'var(--text)', marginBottom: '0.85rem', lineHeight: 1.3,
+                }}>{p.title}</div>
+                <p style={{ fontSize: '0.87rem', color: 'var(--text-2)', lineHeight: 1.65 }}>{p.desc}</p>
                 <div style={{
-                  marginTop: '1.75rem',
-                  fontSize: '0.75rem',
-                  color: 'var(--orange)',
-                  letterSpacing: '0.1em',
-                  fontWeight: 600,
-                  textTransform: 'uppercase',
+                  marginTop: '1.75rem', fontSize: '0.75rem',
+                  color: featured ? 'var(--orange)' : 'var(--muted)',
+                  letterSpacing: '0.1em', fontWeight: 600, textTransform: 'uppercase',
                 }}>
                   Enter Portal →
                 </div>
               </div>
             </a>
-          ))}
+            )
+          })}
         </div>
       </section>
 
@@ -289,10 +307,10 @@ export default function HomePage() {
           fontWeight: 600,
           marginBottom: '1rem',
         }}>
-          Ready to explore the protocol?
+          Stop waiting to get paid.
         </h2>
         <p style={{ color: 'var(--text-2)', marginBottom: '2.5rem', fontSize: '0.95rem' }}>
-          Kyro runs on ADI Testnet (Chain ID 99999). Connect MetaMask to interact.
+          Kyro turns outstanding invoices into instant liquidity — live on ADI Testnet. Connect MetaMask and try it yourself.
         </p>
         <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
           <a href="/sme" className="btn btn-primary" style={{ width: 'auto', margin: 0 }}>Get Started</a>

@@ -65,6 +65,17 @@ async function switchToADI(ethereum: Ethereum): Promise<void> {
 
 // ── Browser wallet (Rabby / MetaMask) ────────────────────────────────────────
 
+/** Force MetaMask to show the account picker, then connect the chosen account. */
+export async function switchWallet(): Promise<`0x${string}`> {
+  const ethereum = await getMetaMask()
+  _provider = ethereum
+  // wallet_requestPermissions forces the account selection dialog even if already connected
+  await ethereum.request({ method: 'wallet_requestPermissions', params: [{ eth_accounts: {} }] })
+  const accounts = (await ethereum.request({ method: 'eth_accounts' })) as string[]
+  await switchToADI(ethereum)
+  return accounts[0] as `0x${string}`
+}
+
 export async function connectWallet(): Promise<`0x${string}`> {
   const ethereum = await getMetaMask()
   _provider = ethereum

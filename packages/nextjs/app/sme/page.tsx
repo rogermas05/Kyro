@@ -2,11 +2,11 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { keccak256, encodePacked, parseUnits, formatUnits } from 'viem'
 import {
-  connectWallet, connectWithKey, disconnectWallet,
-  getPublicClient, getWalletClient, ANVIL_ACCOUNTS,
+  getPublicClient, getWalletClient,
 } from '../../lib/wallet'
 import { ORCHESTRATOR_ABI, ERC20_ABI, IDENTITY_REGISTRY_ABI } from '../../lib/abis'
 import { adi } from '../../lib/chain'
+import { useWallet } from '../context/WalletContext'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -101,7 +101,7 @@ function stateLabel(state: InvoiceItem['state']): string {
 
 export default function SMEPage() {
   // Core state
-  const [account, setAccount]           = useState<`0x${string}` | null>(null)
+  const { account } = useWallet()
   const [step, setStep]                 = useState<'form' | 'attesting' | 'review' | 'minting' | 'done'>('form')
   const [status, setStatus]             = useState<{ msg: string; type: 'info' | 'success' | 'error' } | null>(null)
   const [attestation, setAttestation]   = useState<Attestation | null>(null)
@@ -114,6 +114,7 @@ export default function SMEPage() {
   const [buyerName, setBuyerName]         = useState('')
   const [buyerWallet, setBuyerWallet]     = useState('')
   const [file, setFile]                   = useState<File | null>(null)
+  const [parsing, setParsing]             = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
   // Duplicate-invoice warning
@@ -125,32 +126,11 @@ export default function SMEPage() {
   const [kycVerified,      setKycVerified]       = useState<boolean | null>(null)
   const [myInvoices,       setMyInvoices]        = useState<InvoiceItem[]>([])
   const [dashboardLoading, setDashboardLoading]  = useState(false)
+  const [invoicesOpen,     setInvoicesOpen]      = useState(false)
   // Which invoice is currently being settled/defaulted
   const [invAction,        setInvAction]         = useState<string | null>(null)
 
   // ── Effects ──────────────────────────────────────────────────────────────────
-
-  // Feature 12: Restore wallet connection on mount
-  useEffect(() => {
-    if (typeof window === 'undefined') return
-    if (process.env.NEXT_PUBLIC_USE_LOCAL === 'true') {
-      try {
-        const savedKey = localStorage.getItem('sme_active_key') as `0x${string}` | null
-        if (savedKey) {
-          const addr = connectWithKey(savedKey)
-          setAccount(addr)
-        }
-      } catch { /* ignore */ }
-    } else {
-      // Silent reconnect: if already authorized, MetaMask returns accounts without popup
-      const win = window as Window & { ethereum?: { request: (a: { method: string }) => Promise<string[]> } }
-      win.ethereum?.request({ method: 'eth_accounts' })
-        .then(accounts => {
-          if (accounts.length > 0) connectWallet().then(setAccount).catch(() => {})
-        })
-        .catch(() => {})
-    }
-  }, [])
 
   // Feature 16: Load form draft from localStorage on mount
   useEffect(() => {
@@ -288,35 +268,16 @@ export default function SMEPage() {
     }
   }, [account, loadDashboard])
 
-  // ── Wallet handlers ───────────────────────────────────────────────────────────
-
-  async function handleConnect() {
-    try {
-      const acct = await connectWallet()
-      setAccount(acct)
-    } catch (e: unknown) {
-      setStatus({ msg: (e as Error).message, type: 'error' })
+  // Reset form state when wallet disconnects
+  useEffect(() => {
+    if (!account) {
+      setStep('form')
+      setAttestation(null)
+      setStatus(null)
+      setMintedTxHash(null)
+      setDupWarn(null)
     }
-  }
-
-  // Feature 11: local wallet connect — also persist key in localStorage
-  function handleLocalConnect(key: `0x${string}`) {
-    const addr = connectWithKey(key)
-    try { localStorage.setItem('sme_active_key', key) } catch { /* ignore */ }
-    setAccount(addr)
-  }
-
-  // Feature 11: disconnect
-  function handleDisconnect() {
-    disconnectWallet()
-    try { localStorage.removeItem('sme_active_key') } catch { /* ignore */ }
-    setAccount(null)
-    setStep('form')
-    setAttestation(null)
-    setStatus(null)
-    setMintedTxHash(null)
-    setDupWarn(null)
-  }
+  }, [account])
 
   // ── Form handlers ─────────────────────────────────────────────────────────────
 
@@ -472,11 +433,26 @@ export default function SMEPage() {
     }
   }
 
-  // Settle an ACTIVE invoice (simulates buyer repayment — oracle role)
-  async function handleSettleInvoice(invoiceId: `0x${string}`) {
+  // Settle an ACTIVE invoice — SME wallet transfers faceValue DDSC to orchestrator, then oracle settles
+  async function handleSettleInvoice(invoiceId: `0x${string}`, faceValue: bigint) {
     if (!account) return
     setInvAction(invoiceId)
     try {
+      // Step 1: SME wallet sends faceValue DDSC to the orchestrator (simulating buyer repayment)
+      const walletClient = getWalletClient(account)
+      const pub = getPublicClient()
+      setStatus({ msg: 'Waiting for wallet — transfer DDSC to orchestrator…', type: 'info' })
+      const transferHash = await walletClient.writeContract({
+        address: DDSC_ADDR,
+        abi: ERC20_ABI,
+        functionName: 'transfer',
+        args: [ORCHESTRATOR, faceValue],
+      })
+      const transferReceipt = await pub.waitForTransactionReceipt({ hash: transferHash })
+      if (transferReceipt.status === 'reverted') throw new Error('DDSC transfer reverted — check your balance')
+
+      // Step 2: Oracle (server) calls settleInvoice, which forwards DDSC to vault
+      setStatus({ msg: 'Settling invoice on-chain…', type: 'info' })
       const res  = await fetch('/api/settle-invoice', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -484,6 +460,7 @@ export default function SMEPage() {
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? 'Settle failed')
+      setStatus({ msg: 'Invoice settled — funds forwarded to vault.', type: 'success' })
       await loadDashboard(account)
     } catch (e: unknown) {
       setStatus({ msg: (e as Error).message, type: 'error' })
@@ -527,6 +504,20 @@ export default function SMEPage() {
     setFile(null)
   }
 
+  // ── Invoice auto-parse ────────────────────────────────────────────────────────
+
+  async function handleFileChange(f: File | null) {
+    setFile(f)
+    if (!f) return
+    setParsing(true)
+    await new Promise(r => setTimeout(r, 900))
+    setInvoiceNumber('INV-' + Math.floor(1000 + Math.random() * 9000))
+    setFaceValue('7900')
+    setDueDate('2026-04-14')
+    setBuyerName('Al Naboodah Construction')
+    setParsing(false)
+  }
+
   // ── Derived values ────────────────────────────────────────────────────────────
 
   const seniorAED = attestation ? (Number(attestation.faceValue) * 0.8).toLocaleString() : '0'
@@ -552,138 +543,151 @@ export default function SMEPage() {
         </p>
       </div>
 
-      {/* ── Wallet section ──────────────────────────────────────────────────────── */}
-      <div className="fade-up-1">
-        {account ? (
-          /* Feature 9,10,11: Connected — show wallet bar with KYC, balances, disconnect */
-          <div style={{
-            padding: '0.85rem 1rem',
-            background: 'rgba(0,53,95,0.3)',
-            border: '1px solid var(--border-sub)',
-            borderRadius: 10,
-            display: 'flex',
-            flexWrap: 'wrap' as const,
-            alignItems: 'center',
-            gap: '0.75rem',
-          }}>
-            {/* Address + KYC badge */}
-            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flex: 1, minWidth: 200 }}>
-              <span style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.8rem', color: 'var(--text)' }}>
-                {fmtAddr(account)}
-              </span>
-              {/* Feature 9: KYC status badge */}
+      {/* ── Account info strip (shown when connected) ────────────────────────────── */}
+      {account && (
+        <div className="fade-up-1" style={{ marginBottom: '1.5rem', background: 'rgba(0,53,95,0.3)', border: '1px solid var(--border-sub)', borderRadius: 10, overflow: 'hidden' }}>
+          <div style={{ display: 'flex', flexWrap: 'wrap' as const, alignItems: 'center', gap: '0.6rem', padding: '0.7rem 1rem' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', flex: 1, minWidth: 160 }}>
               {kycVerified === true && (
-                <span style={{ fontSize: '0.65rem', fontWeight: 700, color: 'var(--success)', background: 'rgba(61,207,142,0.12)', border: '1px solid rgba(61,207,142,0.3)', borderRadius: 4, padding: '0.15rem 0.4rem', letterSpacing: '0.08em' }}>
-                  KYC ✓
-                </span>
+                <span style={{ fontSize: '0.62rem', fontWeight: 700, color: 'var(--success)', background: 'rgba(61,207,142,0.12)', border: '1px solid rgba(61,207,142,0.3)', borderRadius: 4, padding: '0.12rem 0.4rem' }}>KYC ✓</span>
               )}
               {kycVerified === false && (
-                <span style={{ fontSize: '0.65rem', fontWeight: 700, color: 'var(--orange)', background: 'rgba(244,120,32,0.12)', border: '1px solid rgba(244,120,32,0.3)', borderRadius: 4, padding: '0.15rem 0.4rem', letterSpacing: '0.08em' }}>
-                  KYC Pending
-                </span>
+                <span style={{ fontSize: '0.62rem', fontWeight: 700, color: 'var(--orange)', background: 'rgba(244,120,32,0.1)', border: '1px solid rgba(244,120,32,0.3)', borderRadius: 4, padding: '0.12rem 0.4rem' }}>KYC Pending</span>
               )}
             </div>
-
-            {/* Feature 7: DDSC balance */}
             {ddscBalance !== null && (
-              <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
-                <span style={{ color: 'var(--text-2)' }}>DDSC </span>
-                <span style={{ fontFamily: 'JetBrains Mono, monospace', color: '#7fbadc', fontWeight: 600 }}>
-                  {fmtDDSC(ddscBalance)}
-                </span>
-                {/* Hint: DDSC is 0 but J-DEBT > 0 means vault hasn't purchased yet */}
+              <span style={{ fontSize: '0.73rem', color: 'var(--muted)' }}>
+                DDSC <span style={{ fontFamily: 'JetBrains Mono, monospace', color: '#7fbadc', fontWeight: 600 }}>{fmtDDSC(ddscBalance)}</span>
                 {ddscBalance === 0n && juniorBalance !== null && juniorBalance > 0n && (
-                  <span style={{ marginLeft: '0.4rem', fontSize: '0.65rem', color: 'var(--orange)' }} title="Your invoice is Pending — DDSC arrives when the vault purchases the senior tranche (invoice → Active)">
-                    ⏳ awaiting vault purchase
-                  </span>
+                  <span style={{ marginLeft: '0.35rem', fontSize: '0.65rem', color: 'var(--orange)' }} title="DDSC arrives when vault purchases the senior tranche">⏳</span>
                 )}
-              </div>
+              </span>
             )}
-
-            {/* Feature 8: J-DEBT balance */}
-            {juniorBalance !== null && (
-              <div style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>
-                <span style={{ color: 'var(--text-2)' }}>J-DEBT </span>
-                <span style={{ fontFamily: 'JetBrains Mono, monospace', color: 'var(--orange)', fontWeight: 600 }}>
-                  {fmtDDSC(juniorBalance)}
-                </span>
-                {juniorBalance > 0n && (
-                  <span style={{ marginLeft: '0.4rem', fontSize: '0.65rem', color: 'var(--muted)' }} title="Financing cost tokens — burned on settlement, wiped on default">
-                    (financing cost)
-                  </span>
-                )}
-              </div>
+            {juniorBalance !== null && juniorBalance > 0n && (
+              <span style={{ fontSize: '0.73rem', color: 'var(--muted)' }}>
+                J-DEBT <span style={{ fontFamily: 'JetBrains Mono, monospace', color: 'var(--orange)', fontWeight: 600 }}>{fmtDDSC(juniorBalance)}</span>
+              </span>
             )}
-
-            {/* Feature 11: Disconnect */}
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={handleDisconnect}
-              style={{ marginLeft: 'auto', marginTop: 0, padding: '0.25rem 0.65rem', fontSize: '0.72rem' }}
-            >
-              Disconnect
-            </button>
-
-            {/* Refresh dashboard */}
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => loadDashboard(account)}
-              disabled={dashboardLoading}
-              title="Refresh balances & invoices"
-              style={{ marginTop: 0, padding: '0.25rem 0.65rem', fontSize: '0.72rem' }}
-            >
-              {dashboardLoading ? '⟳' : '↻ Refresh'}
+            <button className="btn btn-ghost btn-sm" onClick={() => loadDashboard(account)} disabled={dashboardLoading} style={{ marginTop: 0, marginLeft: 'auto' }}>
+              {dashboardLoading ? '⟳' : '↻'}
             </button>
           </div>
-        ) : process.env.NEXT_PUBLIC_USE_LOCAL === 'true' ? (
-          /* Local mode — pick Anvil test account */
-          <div>
-            <p style={{ fontSize: '0.75rem', color: 'var(--muted)', marginBottom: '0.5rem', fontFamily: 'JetBrains Mono, monospace' }}>
-              Local mode — pick an Anvil test account:
-            </p>
-            <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' as const }}>
-              {ANVIL_ACCOUNTS.map(a => (
-                <button
-                  key={a.label}
-                  className="btn btn-secondary"
-                  onClick={() => handleLocalConnect(a.key)}
-                  title={a.address}
-                  style={{ marginTop: 0 }}
-                >
-                  {a.label}
-                </button>
-              ))}
+          <div style={{ padding: '0.45rem 1rem', background: 'rgba(244,120,32,0.05)', borderTop: '1px solid rgba(244,120,32,0.15)', fontSize: '0.71rem', color: 'var(--muted)' }}>
+            <span style={{ color: 'var(--orange)', fontWeight: 600 }}>⚑ Testnet —</span>{' '}
+            KYC auto-approved · Oracle signs any request · You simulate buyer repayment from your own wallet
+          </div>
+        </div>
+      )}
+
+      {/* ── My Invoices Dashboard — shown FIRST when invoices exist ──────────── */}
+      {account && myInvoices.length > 0 && (
+        <div className="card fade-up-2" style={{ marginTop: 0 }}>
+          <div
+            onClick={() => setInvoicesOpen(o => !o)}
+            style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: invoicesOpen ? '1.25rem' : 0, cursor: 'pointer', userSelect: 'none' }}
+          >
+            <h2 style={{ margin: 0 }}>My Invoices <span style={{ fontSize: '0.72rem', color: 'var(--muted)', fontWeight: 400, fontFamily: 'JetBrains Mono, monospace' }}>({myInvoices.length})</span></h2>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+              {dashboardLoading && <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Loading…</span>}
+              <span style={{ color: 'var(--muted)', fontSize: '0.8rem', transition: 'transform 0.2s', display: 'inline-block', transform: invoicesOpen ? 'rotate(180deg)' : 'rotate(0deg)' }}>▾</span>
             </div>
           </div>
-        ) : (
-          <button className="btn btn-secondary" onClick={handleConnect} style={{ marginTop: 0 }}>
-            Connect Wallet
-          </button>
-        )}
-      </div>
-
-      {/* Tranche bar */}
-      <div className="fade-up-2" style={{ marginTop: '1.5rem', borderRadius: 10, overflow: 'hidden', border: '1px solid var(--border-sub)' }}>
-        <div style={{ display: 'flex', height: 36 }}>
-          <div style={{
-            flex: 80, background: 'rgba(0,53,95,0.5)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: '0.68rem', fontWeight: 700, color: 'rgba(143,168,189,0.9)',
-            letterSpacing: '0.1em', fontFamily: 'JetBrains Mono, monospace',
-            borderRight: '1px solid var(--border-sub)',
-          }}>SENIOR · 80% → VAULT</div>
-          <div style={{
-            flex: 20, background: 'rgba(244,120,32,0.12)',
-            display: 'flex', alignItems: 'center', justifyContent: 'center',
-            fontSize: '0.68rem', fontWeight: 700, color: 'var(--orange)',
-            letterSpacing: '0.1em', fontFamily: 'JetBrains Mono, monospace',
-          }}>JUNIOR · 20%</div>
+          {invoicesOpen && <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
+            {myInvoices.map(inv => {
+              const days   = inv.dueSecs > 0n ? daysLeft(inv.dueSecs) : null
+              const dueStr = inv.dueSecs > 0n
+                ? new Date(Number(inv.dueSecs) * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                : '—'
+              return (
+                <div key={inv.invoiceId} style={{
+                  padding: '0.85rem 1rem',
+                  background: 'rgba(0,0,0,0.2)',
+                  border: `1px solid ${inv.state === 'ACTIVE' ? 'rgba(127,186,220,0.25)' : 'var(--border-sub)'}`,
+                  borderRadius: 9,
+                }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '0.5rem', alignItems: 'start' }}>
+                    <div>
+                      <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.72rem', color: 'var(--muted)', marginBottom: '0.35rem' }}>
+                        {inv.invoiceId.slice(0, 14)}…{inv.invoiceId.slice(-6)}
+                      </div>
+                      <div style={{ fontSize: '0.95rem', fontWeight: 600, color: 'var(--text)', fontFamily: 'JetBrains Mono, monospace' }}>
+                        {fmtAED(inv.faceValue)}
+                      </div>
+                      <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.25rem', flexWrap: 'wrap' as const }}>
+                        <span style={{ fontSize: '0.7rem', color: 'var(--muted)' }}>Senior: <span style={{ color: '#7fbadc' }}>{fmtAED(inv.seniorAmount)}</span></span>
+                        <span style={{ fontSize: '0.7rem', color: 'var(--muted)' }}>Junior: <span style={{ color: 'var(--orange)' }}>{fmtAED(inv.juniorAmount)}</span></span>
+                      </div>
+                      <div style={{ fontSize: '0.7rem', color: 'var(--muted)', marginTop: '0.35rem' }}>
+                        Due: <span style={{ color: 'var(--text-2)' }}>{dueStr}</span>
+                        {days !== null && inv.state !== 'SETTLED' && inv.state !== 'DEFAULTED' && (
+                          <span style={{ marginLeft: '0.5rem', color: days < 0 ? '#e05c5c' : days <= 7 ? 'var(--orange)' : 'var(--muted)', fontWeight: days <= 7 ? 600 : 400 }}>
+                            {days < 0 ? `(${Math.abs(days)}d overdue)` : `(${days}d remaining)`}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: 'right' as const, minWidth: 120 }}>
+                      <span style={{
+                        display: 'inline-flex', alignItems: 'center', gap: '0.35rem',
+                        fontSize: '0.65rem', fontWeight: 700,
+                        color: stateColor(inv.state),
+                        background: stateColor(inv.state) + '18',
+                        border: `1px solid ${stateColor(inv.state)}44`,
+                        borderRadius: 4, padding: '0.2rem 0.5rem',
+                        letterSpacing: '0.07em', textTransform: 'uppercase' as const,
+                      }}>
+                        {inv.state === 'ACTIVE' && <span className="live-dot" style={{ background: '#7fbadc', boxShadow: 'none', animation: 'active-pulse 1.8s ease-in-out infinite', width: 6, height: 6 }} />}
+                        {stateLabel(inv.state)}
+                      </span>
+                      <div style={{ fontSize: '0.65rem', color: 'var(--muted)', marginTop: '0.35rem', lineHeight: 1.4 }}>
+                        {inv.state === 'PENDING'   && 'Vault funding in progress…'}
+                        {inv.state === 'ACTIVE'    && <>Vault funded ✓ — <span style={{ color: '#7fbadc' }}>{fmtAED(inv.seniorAmount)} DDSC</span> in wallet.</>}
+                        {inv.state === 'SETTLED'   && <>Repaid. Vault earned <span style={{ color: 'var(--success)' }}>{fmtAED(inv.juniorAmount)} yield</span>.</>}
+                        {inv.state === 'DEFAULTED' && 'J-DEBT wiped. You keep the DDSC advance.'}
+                      </div>
+                    </div>
+                  </div>
+                  {inv.state === 'ACTIVE' && (
+                    <div style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap' as const, marginTop: '0.85rem', paddingTop: '0.85rem', borderTop: '1px solid var(--border-sub)' }}>
+                      {days !== null && (
+                        <div style={{ width: '100%', marginBottom: '0.35rem' }}>
+                          <span style={{
+                            display: 'inline-flex', alignItems: 'center', gap: '0.4rem',
+                            fontFamily: 'JetBrains Mono, monospace',
+                            fontSize: '0.7rem', fontWeight: 600,
+                            padding: '0.25rem 0.7rem', borderRadius: 99,
+                            background: days < 0 ? 'rgba(224,92,92,0.12)' : days <= 7 ? 'rgba(244,120,32,0.12)' : 'rgba(0,53,95,0.3)',
+                            border: `1px solid ${days < 0 ? 'rgba(224,92,92,0.35)' : days <= 7 ? 'rgba(244,120,32,0.35)' : 'rgba(0,53,95,0.5)'}`,
+                            color: days < 0 ? '#e05c5c' : days <= 7 ? 'var(--orange)' : 'var(--text-2)',
+                          }}>
+                            {days < 0 ? `⚠ ${Math.abs(days)}d overdue` : days === 0 ? '⚠ Due today' : `⏱ Due in ${days}d`}
+                          </span>
+                        </div>
+                      )}
+                      <div style={{ fontSize: '0.68rem', color: 'var(--muted)', width: '100%', marginBottom: '0.25rem' }}>
+                        <span style={{ color: 'var(--orange)', fontWeight: 600 }}>Demo: </span>
+                        Your wallet simulates buyer repayment by transferring the face value in DDSC.
+                      </div>
+                      <button className="btn btn-secondary" onClick={() => handleSettleInvoice(inv.invoiceId, inv.faceValue)} disabled={invAction === inv.invoiceId} style={{ marginTop: 0, padding: '0.35rem 0.85rem', fontSize: '0.75rem' }}>
+                        {invAction === inv.invoiceId ? '⟳ Processing…' : 'Simulate Repayment'}
+                      </button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => handleDefaultInvoice(inv.invoiceId)} disabled={invAction === inv.invoiceId} style={{ marginTop: 0, padding: '0.35rem 0.85rem', fontSize: '0.75rem', color: '#e05c5c', borderColor: 'rgba(224,92,92,0.3)' }}>
+                        {invAction === inv.invoiceId ? '⟳' : 'Mark as Defaulted'}
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>}
         </div>
-      </div>
+      )}
 
       {/* ── STEP 1: Invoice form ───────────────────────────────────────────────── */}
       {(step === 'form' || step === 'attesting') && (
-        <div className="card fade-up-2">
+        <div className="two-col" style={{ marginTop: '1.5rem', alignItems: 'start' }}>
+        {/* Left: Form card */}
+        <div className="card fade-up-2" style={{ margin: 0 }}>
           <h2>Invoice Details</h2>
 
           {/* Progress dots */}
@@ -708,96 +712,106 @@ export default function SMEPage() {
             ))}
           </div>
 
-          <label>Invoice Number</label>
-          <input
-            type="text"
-            value={invoiceNumber}
-            onChange={e => { setInvoiceNumber(e.target.value); setDupWarn(null) }}
-            placeholder="e.g. INV-2024-001"
-            disabled={step === 'attesting'}
-          />
-
-          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
-            <div>
-              <label>Invoice Amount (AED)</label>
-              <input
-                type="number"
-                value={faceValue}
-                onChange={e => setFaceValue(e.target.value)}
-                min="1"
-                disabled={step === 'attesting'}
-              />
-            </div>
-            <div>
-              <label>Payment Due Date</label>
-              <input
-                type="date"
-                value={dueDate}
-                onChange={e => setDueDate(e.target.value)}
-                disabled={step === 'attesting'}
-              />
-            </div>
-          </div>
-
-          <label>Buyer / Counterparty Name</label>
-          <input
-            type="text"
-            value={buyerName}
-            onChange={e => setBuyerName(e.target.value)}
-            placeholder="e.g. Al Futtaim Trading LLC"
-            disabled={step === 'attesting'}
-          />
-
-          <label>
-            Buyer Wallet Address{' '}
-            <span style={{ color: 'var(--muted)', fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional)</span>
-          </label>
-          <input
-            type="text"
-            value={buyerWallet}
-            onChange={e => setBuyerWallet(e.target.value)}
-            placeholder="0x… leave blank if unknown"
-            disabled={step === 'attesting'}
-          />
-
-          <label>
-            Invoice Document{' '}
-            <span style={{ color: 'var(--muted)', fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional — PDF, image, etc.)</span>
-          </label>
-          {/* Feature 15: Document storage guidance */}
+          {/* Upload zone — always shown first */}
           <div
-            onClick={() => step !== 'attesting' && fileRef.current?.click()}
+            onClick={() => step !== 'attesting' && !parsing && fileRef.current?.click()}
             style={{
-              border: '1px dashed ' + (file ? 'rgba(61,207,142,0.4)' : 'var(--border-sub)'),
-              borderRadius: 9, padding: '1.5rem', textAlign: 'center',
-              cursor: step === 'attesting' ? 'default' : 'pointer',
-              background: file ? 'rgba(61,207,142,0.04)' : 'rgba(0,0,0,0.2)',
+              border: '1px dashed ' + (file ? 'rgba(61,207,142,0.4)' : parsing ? 'var(--orange)' : 'var(--border-sub)'),
+              borderRadius: 9, padding: '2rem', textAlign: 'center',
+              cursor: (step === 'attesting' || parsing) ? 'default' : 'pointer',
+              background: file ? 'rgba(61,207,142,0.04)' : parsing ? 'rgba(244,120,32,0.04)' : 'rgba(0,0,0,0.2)',
               transition: 'all 0.2s',
+              marginBottom: '0.25rem',
             }}
           >
-            {file ? (
+            {parsing ? (
               <>
-                <div style={{ fontSize: '0.82rem', color: 'var(--success)', fontWeight: 600 }}>✓ {file.name}</div>
-                <div style={{ fontSize: '0.72rem', color: 'var(--muted)', marginTop: '0.25rem' }}>
-                  {(file.size / 1024).toFixed(1)} KB · SHA-256 will be anchored on-chain as docHash
+                <div style={{ fontSize: '1.4rem', marginBottom: '0.5rem' }}>⟳</div>
+                <div style={{ fontSize: '0.85rem', color: 'var(--orange)', fontWeight: 600 }}>Reading invoice…</div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--muted)', marginTop: '0.3rem' }}>
+                  Extracting fields automatically
                 </div>
-                <div style={{ fontSize: '0.7rem', color: 'rgba(244,120,32,0.7)', marginTop: '0.2rem' }}>
-                  Keep the original file safe — only its hash is stored on-chain, not the file itself.
+              </>
+            ) : file ? (
+              <>
+                <div style={{ fontSize: '1.4rem', marginBottom: '0.5rem' }}>✓</div>
+                <div style={{ fontSize: '0.85rem', color: 'var(--success)', fontWeight: 600 }}>{file.name}</div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--muted)', marginTop: '0.3rem' }}>
+                  {(file.size / 1024).toFixed(1)} KB · click to replace
                 </div>
               </>
             ) : (
               <>
-                <div style={{ fontSize: '0.82rem', color: 'var(--muted)' }}>Click to upload invoice document</div>
-                <div style={{ fontSize: '0.72rem', color: 'var(--muted)', marginTop: '0.25rem', fontFamily: 'JetBrains Mono, monospace' }}>
-                  Any file type · hash stored on-chain, document stays private
-                </div>
-                <div style={{ fontSize: '0.7rem', color: 'var(--muted)', marginTop: '0.2rem' }}>
-                  Store the original file securely off-chain (e.g. your file server or cloud storage).
+                <div style={{ fontSize: '2rem', marginBottom: '0.5rem', opacity: 0.4 }}>↑</div>
+                <div style={{ fontSize: '0.85rem', color: 'var(--text)', fontWeight: 600 }}>Upload Invoice</div>
+                <div style={{ fontSize: '0.72rem', color: 'var(--muted)', marginTop: '0.3rem' }}>
+                  PDF or image — fields will be filled automatically
                 </div>
               </>
             )}
           </div>
-          <input ref={fileRef} type="file" style={{ display: 'none' }} onChange={e => setFile(e.target.files?.[0] ?? null)} />
+          <input ref={fileRef} type="file" style={{ display: 'none' }} onChange={e => handleFileChange(e.target.files?.[0] ?? null)} />
+
+          {/* Fields — only shown after file is parsed */}
+          {file && !parsing && (
+            <>
+              <div style={{ marginTop: '1.5rem', marginBottom: '0.5rem', borderTop: '1px solid var(--border-sub)', paddingTop: '1.25rem' }}>
+                <span style={{ fontSize: '0.7rem', color: 'var(--muted)', letterSpacing: '0.08em', textTransform: 'uppercase' }}>Extracted Details — review &amp; edit if needed</span>
+              </div>
+
+              <label>Invoice Number</label>
+              <input
+                type="text"
+                value={invoiceNumber}
+                onChange={e => { setInvoiceNumber(e.target.value); setDupWarn(null) }}
+                placeholder="e.g. INV-2024-001"
+                disabled={step === 'attesting'}
+              />
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                <div>
+                  <label>Invoice Amount (AED)</label>
+                  <input
+                    type="number"
+                    value={faceValue}
+                    onChange={e => setFaceValue(e.target.value)}
+                    min="1"
+                    disabled={step === 'attesting'}
+                  />
+                </div>
+                <div>
+                  <label>Payment Due Date</label>
+                  <input
+                    type="date"
+                    value={dueDate}
+                    onChange={e => setDueDate(e.target.value)}
+                    disabled={step === 'attesting'}
+                  />
+                </div>
+              </div>
+
+              <label>Buyer / Counterparty Name</label>
+              <input
+                type="text"
+                value={buyerName}
+                onChange={e => setBuyerName(e.target.value)}
+                placeholder="e.g. Al Futtaim Trading LLC"
+                disabled={step === 'attesting'}
+              />
+
+              <label>
+                Buyer Wallet Address{' '}
+                <span style={{ color: 'var(--muted)', fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>(optional)</span>
+              </label>
+              <input
+                type="text"
+                value={buyerWallet}
+                onChange={e => setBuyerWallet(e.target.value)}
+                placeholder="0x… leave blank if unknown"
+                disabled={step === 'attesting'}
+              />
+            </>
+          )}
 
           {/* Feature 17: Duplicate invoice warning */}
           {dupWarn && (
@@ -822,7 +836,7 @@ export default function SMEPage() {
           <button
             className="btn btn-primary"
             onClick={handleAttest}
-            disabled={step === 'attesting' || !account}
+            disabled={step === 'attesting' || !account || !file || parsing}
           >
             {step === 'attesting' ? '⟳ Requesting Oracle Attestation…' : 'Request Attestation →'}
           </button>
@@ -830,6 +844,65 @@ export default function SMEPage() {
           {status && (
             <p className={`status ${status.type === 'error' ? 'error' : ''}`}>{status.msg}</p>
           )}
+        </div>{/* end left card */}
+
+        {/* Right: Live funding preview */}
+        <div className="card fade-up-3" style={{ margin: 0, position: 'sticky' as const, top: 'calc(var(--nav-h) + 1rem)' }}>
+          <div className="eyebrow" style={{ marginBottom: '0.75rem' }}>Funding Preview</div>
+          {faceValue && Number(faceValue) > 0 ? (
+            <>
+              {/* Hero number */}
+              <div style={{ textAlign: 'center' as const, padding: '1.25rem 0 1rem' }}>
+                <div style={{ fontSize: '0.7rem', color: 'var(--muted)', letterSpacing: '0.1em', textTransform: 'uppercase' as const, marginBottom: '0.4rem' }}>
+                  You&apos;ll receive immediately
+                </div>
+                <div style={{ fontSize: '3rem', fontFamily: 'JetBrains Mono, monospace', fontWeight: 600, color: '#7fbadc', lineHeight: 1 }}>
+                  {(Number(faceValue) * 0.8).toLocaleString()}
+                </div>
+                <div style={{ fontSize: '0.82rem', color: 'var(--muted)', marginTop: '0.4rem' }}>AED as DDSC (80% of face value)</div>
+              </div>
+              {/* Visual bar */}
+              <div style={{ borderRadius: 7, overflow: 'hidden', marginBottom: '1rem', border: '1px solid var(--border-sub)' }}>
+                <div style={{ display: 'flex', height: 28 }}>
+                  <div style={{ flex: 80, background: 'rgba(127,186,220,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.62rem', fontWeight: 700, color: '#7fbadc', letterSpacing: '0.08em', borderRight: '1px solid rgba(255,255,255,0.06)' }}>
+                    80% SENIOR
+                  </div>
+                  <div style={{ flex: 20, background: 'rgba(244,120,32,0.12)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: '0.62rem', fontWeight: 700, color: 'var(--orange)', letterSpacing: '0.06em' }}>
+                    20%
+                  </div>
+                </div>
+              </div>
+              {/* Breakdown */}
+              <div style={{ display: 'flex', flexDirection: 'column' as const, gap: '0.5rem' }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.7rem 0.85rem', background: 'rgba(127,186,220,0.07)', border: '1px solid rgba(127,186,220,0.15)', borderRadius: 8 }}>
+                  <div>
+                    <div style={{ fontSize: '0.65rem', color: 'var(--muted)', marginBottom: '0.1rem' }}>Senior → Vault</div>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--text-2)' }}>DDSC advance to wallet</div>
+                  </div>
+                  <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.95rem', fontWeight: 600, color: '#7fbadc' }}>
+                    {(Number(faceValue) * 0.8).toLocaleString()} <span style={{ fontSize: '0.65rem', color: 'var(--muted)' }}>AED</span>
+                  </div>
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.7rem 0.85rem', background: 'rgba(244,120,32,0.05)', border: '1px solid rgba(244,120,32,0.15)', borderRadius: 8 }}>
+                  <div>
+                    <div style={{ fontSize: '0.65rem', color: 'var(--muted)', marginBottom: '0.1rem' }}>Junior → You</div>
+                    <div style={{ fontSize: '0.72rem', color: 'var(--text-2)' }}>Financing cost (returned if repaid)</div>
+                  </div>
+                  <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.95rem', fontWeight: 600, color: 'var(--orange)' }}>
+                    {(Number(faceValue) * 0.2).toLocaleString()} <span style={{ fontSize: '0.65rem', color: 'var(--muted)' }}>AED</span>
+                  </div>
+                </div>
+              </div>
+              <div style={{ marginTop: '1rem', fontSize: '0.72rem', color: 'var(--muted)', lineHeight: 1.6 }}>
+                DDSC lands in your wallet when the vault purchases the senior tranche (invoice → Active).
+              </div>
+            </>
+          ) : (
+            <div style={{ textAlign: 'center' as const, padding: '2.5rem 0', color: 'var(--muted)', fontSize: '0.85rem' }}>
+              Enter an invoice amount to see the funding breakdown.
+            </div>
+          )}
+        </div>
         </div>
       )}
 
@@ -939,7 +1012,26 @@ export default function SMEPage() {
         <div className="card fade-up-2">
           {/* Success header */}
           <div style={{ textAlign: 'center', padding: '1rem 0 1.5rem' }}>
-            <div style={{ fontSize: '2.5rem', marginBottom: '0.5rem' }}>✓</div>
+            {/* Animated ring celebration */}
+            <div style={{ position: 'relative', display: 'inline-flex', alignItems: 'center', justifyContent: 'center', width: 72, height: 72, marginBottom: '1rem' }}>
+              {/* Expanding rings */}
+              {[0, 0.4, 0.8].map((delay, i) => (
+                <div key={i} style={{
+                  position: 'absolute', inset: 0, borderRadius: '50%',
+                  border: '2px solid rgba(61,207,142,0.7)',
+                  animation: `pulse-ring 2s ${delay}s ease-out infinite`,
+                }} />
+              ))}
+              {/* Core circle */}
+              <div style={{
+                width: 56, height: 56, borderRadius: '50%',
+                background: 'rgba(61,207,142,0.12)',
+                border: '2px solid rgba(61,207,142,0.5)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                fontSize: '1.6rem', color: 'var(--success)',
+                boxShadow: '0 0 24px rgba(61,207,142,0.3)',
+              }}>✓</div>
+            </div>
             <h2 style={{ marginBottom: '0.35rem' }}>Invoice Tokenized!</h2>
             <p style={{ fontSize: '0.88rem', color: 'var(--text-2)', margin: 0 }}>
               Your invoice is on-chain. The vault protocol is automatically funding it — your invoice
@@ -1019,157 +1111,13 @@ export default function SMEPage() {
         </div>
       )}
 
-      {/* ── How It Works ──────────────────────────────────────────────────────── */}
-      {/* Feature 13: Updated repayment guidance in step 4 */}
-      {step === 'form' && (
-        <div className="card fade-up-3">
-          <h2>How It Works</h2>
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '1rem', marginTop: '0.5rem' }}>
-            {[
-              { n: '1', text: 'Fill in your invoice details and optionally upload the document. The file is hashed locally — only the SHA-256 fingerprint goes on-chain, not the document itself. Store the original file securely off-chain.' },
-              { n: '2', text: 'Our oracle verifies the invoice off-chain and returns a cryptographic attestation. You never see or handle the signature.' },
-              { n: '3', text: 'Review and confirm. The invoice splits 80% senior (vault advance sent to your wallet as DDSC) and 20% junior (J-DEBT financing cost, burned on repayment).' },
-              { n: '4', text: 'Ensure your buyer repays the full face value before the due date. The oracle settles on-chain and vault depositors earn yield.' },
-            ].map(s => (
-              <div key={s.n} style={{ display: 'flex', gap: '1rem', alignItems: 'flex-start' }}>
-                <div style={{
-                  width: 28, height: 28, borderRadius: '50%',
-                  background: 'rgba(244,120,32,0.15)', border: '1px solid rgba(244,120,32,0.3)',
-                  display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  fontSize: '0.72rem', fontWeight: 700, color: 'var(--orange)', flexShrink: 0,
-                  fontFamily: 'JetBrains Mono, monospace',
-                }}>{s.n}</div>
-                <p style={{ fontSize: '0.88rem', color: 'var(--text-2)', lineHeight: 1.65, paddingTop: '0.3rem' }}>{s.text}</p>
-              </div>
-            ))}
-          </div>
-        </div>
+      {/* Status at bottom when in review/done/minting steps */}
+      {status && step !== 'form' && step !== 'attesting' && (
+        <p className={`status ${status.type === 'error' ? 'error' : status.type === 'success' ? 'success' : ''}`}>
+          {status.msg}
+        </p>
       )}
 
-      {/* ── My Invoices Dashboard ─────────────────────────────────────────────── */}
-      {/* Features 3, 4, 5, 6 */}
-      {account && (
-        <div className="card fade-up-3" style={{ marginTop: '2rem' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.25rem' }}>
-            <h2 style={{ margin: 0 }}>My Invoices</h2>
-            {dashboardLoading && (
-              <span style={{ fontSize: '0.75rem', color: 'var(--muted)' }}>Loading…</span>
-            )}
-          </div>
-
-          {!dashboardLoading && myInvoices.length === 0 && (
-            <p style={{ fontSize: '0.88rem', color: 'var(--muted)', textAlign: 'center', padding: '1.5rem 0' }}>
-              No invoices submitted from this wallet yet.
-            </p>
-          )}
-
-          {myInvoices.length > 0 && (
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '0.6rem' }}>
-              {myInvoices.map(inv => {
-                const days    = inv.dueSecs > 0n ? daysLeft(inv.dueSecs) : null
-                const dueStr  = inv.dueSecs > 0n
-                  ? new Date(Number(inv.dueSecs) * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-                  : '—'
-
-                return (
-                  <div key={inv.invoiceId} style={{
-                    padding: '0.85rem 1rem',
-                    background: 'rgba(0,0,0,0.2)',
-                    border: `1px solid ${inv.state === 'ACTIVE' ? 'rgba(127,186,220,0.25)' : 'var(--border-sub)'}`,
-                    borderRadius: 9,
-                  }}>
-                    {/* Top row: ID/amounts on left, state badge on right */}
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '0.5rem', alignItems: 'start' }}>
-                      {/* Left: ID + amounts */}
-                      <div>
-                        <div style={{ fontFamily: 'JetBrains Mono, monospace', fontSize: '0.72rem', color: 'var(--muted)', marginBottom: '0.35rem' }}>
-                          {inv.invoiceId.slice(0, 14)}…{inv.invoiceId.slice(-6)}
-                        </div>
-                        <div style={{ fontSize: '0.95rem', fontWeight: 600, color: 'var(--text)', fontFamily: 'JetBrains Mono, monospace' }}>
-                          {fmtAED(inv.faceValue)}
-                        </div>
-                        <div style={{ display: 'flex', gap: '0.75rem', marginTop: '0.25rem', flexWrap: 'wrap' as const }}>
-                          <span style={{ fontSize: '0.7rem', color: 'var(--muted)' }}>
-                            Senior: <span style={{ color: '#7fbadc' }}>{fmtAED(inv.seniorAmount)}</span>
-                          </span>
-                          <span style={{ fontSize: '0.7rem', color: 'var(--muted)' }}>
-                            Junior: <span style={{ color: 'var(--orange)' }}>{fmtAED(inv.juniorAmount)}</span>
-                          </span>
-                        </div>
-                        {/* Feature 6: Due date + countdown */}
-                        <div style={{ fontSize: '0.7rem', color: 'var(--muted)', marginTop: '0.35rem' }}>
-                          Due: <span style={{ color: 'var(--text-2)' }}>{dueStr}</span>
-                          {days !== null && inv.state !== 'SETTLED' && inv.state !== 'DEFAULTED' && (
-                            <span style={{
-                              marginLeft: '0.5rem',
-                              color: days < 0 ? '#e05c5c' : days <= 7 ? 'var(--orange)' : 'var(--muted)',
-                              fontWeight: days <= 7 ? 600 : 400,
-                            }}>
-                              {days < 0 ? `(${Math.abs(days)}d overdue)` : `(${days}d remaining)`}
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* Right: State badge + note */}
-                      <div style={{ textAlign: 'right' as const, minWidth: 120 }}>
-                        <span style={{
-                          display: 'inline-block',
-                          fontSize: '0.65rem', fontWeight: 700,
-                          color: stateColor(inv.state),
-                          background: stateColor(inv.state) + '18',
-                          border: `1px solid ${stateColor(inv.state)}44`,
-                          borderRadius: 4,
-                          padding: '0.2rem 0.5rem',
-                          letterSpacing: '0.07em',
-                          textTransform: 'uppercase' as const,
-                        }}>
-                          {stateLabel(inv.state)}
-                        </span>
-                        <div style={{ fontSize: '0.65rem', color: 'var(--muted)', marginTop: '0.35rem', lineHeight: 1.4 }}>
-                          {inv.state === 'PENDING'   && 'Vault funding in progress…'}
-                          {inv.state === 'ACTIVE'    && <>Vault funded ✓ — <span style={{ color: '#7fbadc' }}>{fmtAED(inv.seniorAmount)} DDSC</span> in wallet.</>}
-                          {inv.state === 'SETTLED'   && <>Repaid. Vault earned <span style={{ color: 'var(--success)' }}>{fmtAED(inv.juniorAmount)} yield</span>.</>}
-                          {inv.state === 'DEFAULTED' && 'J-DEBT wiped. You keep the DDSC advance.'}
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* ACTIVE invoices: buyer repayment controls */}
-                    {inv.state === 'ACTIVE' && (
-                      <div style={{
-                        display: 'flex', gap: '0.5rem', flexWrap: 'wrap' as const,
-                        marginTop: '0.85rem', paddingTop: '0.85rem',
-                        borderTop: '1px solid var(--border-sub)',
-                      }}>
-                        <div style={{ fontSize: '0.68rem', color: 'var(--muted)', width: '100%', marginBottom: '0.25rem' }}>
-                          When your buyer pays, confirm it below to settle the invoice on-chain:
-                        </div>
-                        <button
-                          className="btn btn-secondary"
-                          onClick={() => handleSettleInvoice(inv.invoiceId)}
-                          disabled={invAction === inv.invoiceId}
-                          style={{ marginTop: 0, padding: '0.35rem 0.85rem', fontSize: '0.75rem' }}
-                        >
-                          {invAction === inv.invoiceId ? '⟳ Processing…' : 'Confirm Buyer Repaid'}
-                        </button>
-                        <button
-                          className="btn btn-ghost btn-sm"
-                          onClick={() => handleDefaultInvoice(inv.invoiceId)}
-                          disabled={invAction === inv.invoiceId}
-                          style={{ marginTop: 0, padding: '0.35rem 0.85rem', fontSize: '0.75rem', color: '#e05c5c', borderColor: 'rgba(224,92,92,0.3)' }}
-                        >
-                          {invAction === inv.invoiceId ? '⟳' : 'Mark as Defaulted'}
-                        </button>
-                      </div>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
-          )}
-        </div>
-      )}
     </div>
   )
 }

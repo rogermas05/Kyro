@@ -104,7 +104,10 @@ export async function POST(req: NextRequest) {
       functionName: 'mint',
       args:         [vaultAddr as `0x${string}`, needed],
     })
-    await pub.waitForTransactionReceipt({ hash: mintHash })
+    const mintReceipt = await pub.waitForTransactionReceipt({ hash: mintHash })
+    if (mintReceipt.status === 'reverted') {
+      return NextResponse.json({ error: 'DDSC mint transaction reverted' }, { status: 500 })
+    }
   }
 
   // Call vault.purchaseSeniorTranche — sends DDSC to SME, receives S-DEBT
@@ -114,7 +117,10 @@ export async function POST(req: NextRequest) {
     functionName: 'purchaseSeniorTranche',
     args:         [invoiceId as `0x${string}`],
   })
-  await pub.waitForTransactionReceipt({ hash })
+  const receipt = await pub.waitForTransactionReceipt({ hash })
+  if (receipt.status === 'reverted') {
+    return NextResponse.json({ error: 'purchaseSeniorTranche transaction reverted — check roles and vault balance' }, { status: 500 })
+  }
 
   return NextResponse.json({ hash, seniorAmount: seniorAmt.toString() })
 }
