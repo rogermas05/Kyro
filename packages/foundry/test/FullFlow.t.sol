@@ -312,33 +312,25 @@ contract FullFlowTest is Test {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// @notice Prove a zero-ADI SME wallet can call mintInvoice() gas-free.
-    ///         Uses the MockEP helper so sponsor + account sign the SAME opHash
-    ///         (computed before paymasterAndData sig is injected) — same proven
-    ///         pattern as SignaturePaymaster.t.sol E2E test.
+    ///         Uses the full MinimalEntryPoint flow with time-bounded sponsorship.
     function test_Track2_SponsoredMintWithSmartAccount() public {
-        // ── Local MockEP + fresh paymaster pointing to it ─────────────────────
-        MockEP mockEP = new MockEP();
+        vm.warp(1000);
 
-        vm.startPrank(admin);
-        SignaturePaymaster pm2 = new SignaturePaymaster(address(mockEP), sponsorSigner, admin);
-        vm.stopPrank();
-
-        vm.deal(admin, 1 ether);
+        vm.deal(admin, 2 ether);
         vm.prank(admin);
-        pm2.deposit{value: 0.5 ether}();
+        paymaster.deposit{value: 1 ether}();
 
-        // ── Deploy smart account via factory (fresh factory uses mockEP) ──────
-        SimpleSmartAccountFactory f2 = new SimpleSmartAccountFactory(address(mockEP));
-        address predicted = f2.getAddress(smeOwner, 1);
+        // ── Deploy smart account via factory ────────────────────────────────────
+        SimpleSmartAccount smartAcct = factory.createAccount(smeOwner, 1);
+        address predicted = address(smartAcct);
 
-        // KYC-register the predicted smart account address
+        // KYC-register the smart account
         vm.startPrank(admin);
-        registry.registerIdentity(predicted, 784);
-        registry.setKycStatus(predicted, true);
+        if (!registry.isVerified(predicted)) {
+            registry.registerIdentity(predicted, 784);
+            registry.setKycStatus(predicted, true);
+        }
         vm.stopPrank();
-
-        SimpleSmartAccount smartAcct = f2.createAccount(smeOwner, 1);
-        assertEq(smartAcct.owner(), smeOwner);
 
         // ── Build mintInvoice calldata ────────────────────────────────────────
         bytes32 inv2    = keccak256("ADI-INV-002");
@@ -346,71 +338,65 @@ contract FullFlowTest is Test {
         bytes32 doc2    = keccak256("shipping-docs-002");
         bytes memory proof2 = _makeProof(inv2, faceValue, due2, doc2);
 
-        bytes memory executeCalldata = abi.encodeWithSignature(
-            "execute(address,uint256,bytes)",
-            address(orchestrator),
-            uint256(0),
-            abi.encodeWithSelector(
-                InvoiceOrchestrator.mintInvoice.selector,
-                inv2, faceValue, due2, doc2, counterparty, proof2
-            )
+        bytes memory executeCalldata = abi.encodeCall(
+            SimpleSmartAccount.execute,
+            (address(orchestrator), 0,
+             abi.encodeCall(InvoiceOrchestrator.mintInvoice, (inv2, faceValue, due2, doc2, counterparty, proof2)))
         );
 
-        // ── Build UserOperation — empty paymasterAndData so opHash is stable ────
-        // (same pattern as SignaturePaymaster.t.sol: compute hash from empty pmd,
-        //  then attach real sig at correct offset [paymaster 20B|verGas 16B|postGas 16B|sig 65B])
+        // ── Build UserOperation ─────────────────────────────────────────────────
         PackedUserOperation memory op = PackedUserOperation({
-            sender:            address(smartAcct),
-            nonce:             0,
-            initCode:          bytes(""),
+            sender:            predicted,
+            nonce:             entryPoint.getNonce(predicted, 0),
+            initCode:          "",
             callData:          executeCalldata,
-            accountGasLimits:  bytes32(uint256(150_000) << 128 | uint256(50_000)),
+            accountGasLimits:  bytes32(uint256(200_000) << 128 | uint256(100_000)),
             preVerificationGas: 50_000,
             gasFees:           bytes32(uint256(1 gwei) << 128 | uint256(1 gwei)),
-            paymasterAndData:  bytes(""),  // empty until after opHash computed
-            signature:         bytes("")
+            paymasterAndData:  "",
+            signature:         ""
         });
 
-        // ── Compute opHash BEFORE injecting any signatures ────────────────────
-        bytes32 opHash = mockEP.getUserOpHash(op);
+        // ── Sponsor signs via getHash (no circular dependency) ──────────────────
+        uint48 validUntil = uint48(block.timestamp + 300);
+        uint48 validAfter = uint48(block.timestamp);
 
-        // ── Account owner signs opHash ────────────────────────────────────────
+        // Replicate paymaster.getHash in memory
+        bytes32 pmHash = keccak256(abi.encode(
+            op.sender, op.nonce,
+            keccak256(op.initCode), keccak256(op.callData),
+            op.accountGasLimits, op.preVerificationGas, op.gasFees,
+            block.chainid, address(entryPoint), address(paymaster),
+            validUntil, validAfter
+        ));
+        bytes32 pmEthHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", pmHash));
+        (uint8 sv, bytes32 sr, bytes32 ss) = vm.sign(sponsorPrivKey, pmEthHash);
+
+        op.paymasterAndData = abi.encodePacked(
+            address(paymaster),
+            uint128(100_000),
+            uint128(50_000),
+            validUntil,
+            validAfter,
+            abi.encodePacked(sr, ss, sv)
+        );
+
+        // ── Account owner signs the userOpHash ──────────────────────────────────
+        bytes32 opHash = entryPoint.getUserOpHash(op);
         bytes32 acctEthHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", opHash));
         (uint8 av, bytes32 ar, bytes32 as_) = vm.sign(smeOwnerKey, acctEthHash);
         op.signature = abi.encodePacked(ar, as_, av);
 
-        // ── Sponsor signs opHash and packs into paymasterAndData ─────────────
-        // Layout: [paymaster 20B] [verGasLimit 16B] [postOpGasLimit 16B] [sig 65B]
-        // SPONSOR_SIG_OFFSET = 52 (= 20 + 16 + 16)
-        bytes32 sponsorHash = keccak256(abi.encodePacked(opHash, block.chainid, address(pm2)));
-        bytes32 sponsorEthHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", sponsorHash));
-        (uint8 sv, bytes32 sr, bytes32 ss) = vm.sign(sponsorPrivKey, sponsorEthHash);
-        op.paymasterAndData = abi.encodePacked(
-            address(pm2), uint128(100_000), uint128(50_000), abi.encodePacked(sr, ss, sv)
-        );
+        // ── Submit through EntryPoint ───────────────────────────────────────────
+        assertEq(smeOwner.balance, 0);
 
-        // ── Validate paymaster (passes opHash explicitly — proven pattern) ─────
-        (, uint256 pmVal) = mockEP.callValidatePaymaster(address(pm2), op, opHash);
-        assertEq(pmVal, 0); // 0 = success
-
-        // ── Validate account ──────────────────────────────────────────────────
-        uint256 acctVal = mockEP.callValidateUserOp(address(smartAcct), op, opHash, 0);
-        assertEq(acctVal, 0); // 0 = success
-
-        // ── Execute mintInvoice as if called by EntryPoint ────────────────────
-        assertEq(smeOwner.balance, 0); // zero ADI — no gas needed
-        vm.prank(address(mockEP));
-        smartAcct.execute(
-            address(orchestrator), 0,
-            abi.encodeWithSelector(
-                InvoiceOrchestrator.mintInvoice.selector,
-                inv2, faceValue, due2, doc2, counterparty, proof2
-            )
-        );
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = op;
+        entryPoint.handleOps(ops, payable(admin));
 
         // Invoice minted by smart account despite SME EOA having zero ADI
         (address smAddr,,,,) = orchestrator.invoices(inv2);
-        assertEq(smAddr, address(smartAcct));
+        assertEq(smAddr, predicted);
     }
 
     // ─────────────────────────────────────────────────────────────────────────

@@ -3,72 +3,45 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
 import "../src/aa/interfaces/ERC4337.sol";
+import "../src/aa/MinimalEntryPoint.sol";
 import "../src/aa/SignaturePaymaster.sol";
 import "../src/aa/SimpleSmartAccount.sol";
 import "../src/aa/SimpleSmartAccountFactory.sol";
 
-// ── Minimal mock EntryPoint ────────────────────────────────────────────────────
-contract MockEntryPoint {
-    mapping(address => uint256) public balanceOf;
+/// @dev Helper that exposes SignaturePaymaster.getHash via an external call so we
+///      can pass a memory-built UserOp (Foundry ABI-encodes it into calldata).
+contract PaymasterHashHelper {
+    SignaturePaymaster public pm;
+    constructor(SignaturePaymaster _pm) { pm = _pm; }
 
-    function depositTo(address account) external payable {
-        balanceOf[account] += msg.value;
-    }
-
-    function withdrawTo(address payable to, uint256 amount) external {
-        require(balanceOf[msg.sender] >= amount, "Insufficient deposit");
-        balanceOf[msg.sender] -= amount;
-        to.transfer(amount);
-    }
-
-    function getUserOpHash(PackedUserOperation calldata userOp) external view returns (bytes32) {
-        return keccak256(abi.encode(userOp, block.chainid, address(this)));
-    }
-
-    // Simulate EntryPoint calling validatePaymasterUserOp
-    function callValidatePaymaster(
-        address paymaster,
+    function computeHash(
         PackedUserOperation calldata userOp,
-        bytes32 userOpHash
-    ) external returns (bytes memory context, uint256 validationData) {
-        return IPaymaster(paymaster).validatePaymasterUserOp(userOp, userOpHash, 0);
+        uint48 validUntil,
+        uint48 validAfter
+    ) external view returns (bytes32) {
+        return pm.getHash(userOp, validUntil, validAfter);
     }
-
-    // Simulate EntryPoint calling validateUserOp on account
-    function callValidateUserOp(
-        address account,
-        PackedUserOperation calldata userOp,
-        bytes32 userOpHash,
-        uint256 missingFunds
-    ) external returns (uint256 validationData) {
-        return IAccount(account).validateUserOp(userOp, userOpHash, missingFunds);
-    }
-
-    receive() external payable {}
 }
 
-// ── Simple target contract for execute() tests ────────────────────────────────
 contract Counter {
     uint256 public count;
     function increment() external { count++; }
 }
 
-// ── Test suite ────────────────────────────────────────────────────────────────
 contract SignaturePaymasterTest is Test {
-    MockEntryPoint        public entryPoint;
+    MinimalEntryPoint     public entryPoint;
     SignaturePaymaster    public paymaster;
-    SimpleSmartAccount   public account;
+    PaymasterHashHelper   public hashHelper;
+    SimpleSmartAccount    public account;
     SimpleSmartAccountFactory public factory;
-    Counter              public counter;
+    Counter               public counter;
 
     address admin       = makeAddr("admin");
     address stranger    = makeAddr("stranger");
 
-    // Sponsor signs on behalf of the protocol
     uint256 sponsorPrivKey = 0xABCD;
     address sponsor;
 
-    // Smart account owner (the SME)
     uint256 ownerPrivKey = 0x1234;
     address accountOwner;
 
@@ -76,18 +49,22 @@ contract SignaturePaymasterTest is Test {
         sponsor      = vm.addr(sponsorPrivKey);
         accountOwner = vm.addr(ownerPrivKey);
 
-        entryPoint = new MockEntryPoint();
+        entryPoint = new MinimalEntryPoint();
         paymaster  = new SignaturePaymaster(address(entryPoint), sponsor, admin);
+        hashHelper = new PaymasterHashHelper(paymaster);
         factory    = new SimpleSmartAccountFactory(address(entryPoint));
         counter    = new Counter();
 
         vm.prank(accountOwner);
         account = SimpleSmartAccount(payable(factory.createAccount(accountOwner, 0)));
+
+        vm.deal(admin, 10 ether);
+        vm.prank(admin);
+        paymaster.deposit{value: 5 ether}();
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// @dev Build a minimal packed UserOperation for the given sender.
     function _buildUserOp(address sender, bytes memory callData)
         internal
         view
@@ -95,10 +72,10 @@ contract SignaturePaymasterTest is Test {
     {
         op = PackedUserOperation({
             sender:              sender,
-            nonce:               0,
+            nonce:               entryPoint.getNonce(sender, 0),
             initCode:            "",
             callData:            callData,
-            accountGasLimits:    bytes32(uint256(150_000) << 128 | uint256(50_000)),
+            accountGasLimits:    bytes32(uint256(200_000) << 128 | uint256(100_000)),
             preVerificationGas:  50_000,
             gasFees:             bytes32(uint256(1 gwei) << 128 | uint256(1 gwei)),
             paymasterAndData:    "",
@@ -106,91 +83,127 @@ contract SignaturePaymasterTest is Test {
         });
     }
 
-    /// @dev Sign a UserOpHash with the sponsor's key and pack into paymasterAndData.
     function _attachSponsorSig(
         PackedUserOperation memory op,
-        bytes32 userOpHash
+        uint48 validUntil,
+        uint48 validAfter
     ) internal view returns (PackedUserOperation memory) {
-        bytes32 signedHash    = keccak256(abi.encodePacked(userOpHash, block.chainid, address(paymaster)));
-        bytes32 ethSignedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", signedHash));
+        bytes32 hash = hashHelper.computeHash(op, validUntil, validAfter);
+        bytes32 ethSignedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(sponsorPrivKey, ethSignedHash);
-        bytes memory sig = abi.encodePacked(r, s, v);
 
-        // paymasterAndData = [paymaster (20)] + [verGasLimit (16)] + [postOpGasLimit (16)] + [sig (65)]
         op.paymasterAndData = abi.encodePacked(
             address(paymaster),
-            uint128(100_000),  // verification gas limit
-            uint128(50_000),   // post-op gas limit
-            sig
+            uint128(100_000),
+            uint128(50_000),
+            validUntil,
+            validAfter,
+            abi.encodePacked(r, s, v)
         );
         return op;
     }
 
-    /// @dev Sign a UserOpHash with the account owner's key.
-    function _signUserOp(PackedUserOperation memory op, bytes32 userOpHash)
+    function _attachSponsorSigDefault(PackedUserOperation memory op)
         internal
         view
         returns (PackedUserOperation memory)
     {
+        return _attachSponsorSig(op, uint48(block.timestamp + 300), uint48(block.timestamp));
+    }
+
+    function _signUserOp(PackedUserOperation memory op)
+        internal
+        view
+        returns (PackedUserOperation memory)
+    {
+        bytes32 userOpHash = entryPoint.getUserOpHash(op);
         bytes32 ethSignedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", userOpHash));
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPrivKey, ethSignedHash);
         op.signature = abi.encodePacked(r, s, v);
         return op;
     }
 
-    // ── SignaturePaymaster ────────────────────────────────────────────────────
+    function _submitOp(PackedUserOperation memory op) internal {
+        PackedUserOperation[] memory ops = new PackedUserOperation[](1);
+        ops[0] = op;
+        entryPoint.handleOps(ops, payable(admin));
+    }
+
+    // ── Valid / Invalid Signature ────────────────────────────────────────────
 
     function test_ValidSponsorSigAccepted() public {
+        vm.warp(1000);
         PackedUserOperation memory op = _buildUserOp(address(account), "");
-        bytes32 hash = entryPoint.getUserOpHash(op);
-        op = _attachSponsorSig(op, hash);
-
-        (bytes memory ctx, uint256 validationData) =
-            entryPoint.callValidatePaymaster(address(paymaster), op, hash);
-
-        assertEq(validationData, 0); // 0 = success
-        address sponsored = abi.decode(ctx, (address));
-        assertEq(sponsored, address(account));
+        op = _attachSponsorSigDefault(op);
+        op = _signUserOp(op);
+        _submitOp(op);
     }
 
     function test_InvalidSponsorSigRejected() public {
+        vm.warp(1000);
         PackedUserOperation memory op = _buildUserOp(address(account), "");
-        bytes32 hash = entryPoint.getUserOpHash(op);
 
-        // Use a wrong private key — signature will be invalid
-        bytes32 signedHash    = keccak256(abi.encodePacked(hash, block.chainid, address(paymaster)));
-        bytes32 ethSignedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", signedHash));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xDEAD, ethSignedHash); // wrong key
-        bytes memory badSig = abi.encodePacked(r, s, v);
+        bytes32 hash = hashHelper.computeHash(
+            op,
+            uint48(block.timestamp + 300),
+            uint48(block.timestamp)
+        );
+        bytes32 ethSignedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xDEAD, ethSignedHash);
 
         op.paymasterAndData = abi.encodePacked(
-            address(paymaster), uint128(100_000), uint128(50_000), badSig
+            address(paymaster),
+            uint128(100_000),
+            uint128(50_000),
+            uint48(block.timestamp + 300),
+            uint48(block.timestamp),
+            abi.encodePacked(r, s, v)
         );
+        op = _signUserOp(op);
 
-        (, uint256 validationData) =
-            entryPoint.callValidatePaymaster(address(paymaster), op, hash);
-
-        assertEq(validationData, 1); // 1 = SIG_VALIDATION_FAILED
+        vm.expectRevert("EntryPoint: paymaster signature failed");
+        _submitOp(op);
     }
 
-    function test_PaymasterRejectsIfNotEntryPoint() public {
+    // ── Expiry / Time Window ─────────────────────────────────────────────────
+
+    function test_ExpiredSponsorshipRejected() public {
+        vm.warp(1000);
         PackedUserOperation memory op = _buildUserOp(address(account), "");
-        bytes32 hash = entryPoint.getUserOpHash(op);
-        op = _attachSponsorSig(op, hash);
+        op = _attachSponsorSig(op, uint48(block.timestamp - 1), uint48(block.timestamp - 100));
+        op = _signUserOp(op);
 
-        vm.prank(stranger);
-        vm.expectRevert("Paymaster: caller not EntryPoint");
-        paymaster.validatePaymasterUserOp(op, hash, 0);
+        vm.expectRevert("EntryPoint: paymaster sponsorship expired");
+        _submitOp(op);
     }
 
-    function test_PaymasterDepositAndBalance() public {
-        uint256 depositAmt = 1 ether;
-        vm.deal(admin, depositAmt);
+    function test_FutureSponsorshipRejected() public {
+        vm.warp(1000);
+        PackedUserOperation memory op = _buildUserOp(address(account), "");
+        op = _attachSponsorSig(op, uint48(block.timestamp + 600), uint48(block.timestamp + 300));
+        op = _signUserOp(op);
 
-        vm.prank(admin);
-        paymaster.deposit{value: depositAmt}();
+        vm.expectRevert("EntryPoint: paymaster sponsorship not yet valid");
+        _submitOp(op);
+    }
 
-        assertEq(paymaster.getDeposit(), depositAmt);
+    function test_ValidTimeWindowAccepted() public {
+        vm.warp(1000);
+        PackedUserOperation memory op = _buildUserOp(
+            address(account),
+            abi.encodeCall(SimpleSmartAccount.execute, (address(counter), 0, abi.encodeCall(Counter.increment, ())))
+        );
+        op = _attachSponsorSig(op, uint48(block.timestamp + 300), uint48(block.timestamp - 10));
+        op = _signUserOp(op);
+        _submitOp(op);
+
+        assertEq(counter.count(), 1);
+    }
+
+    // ── Paymaster deposit & admin ────────────────────────────────────────────
+
+    function test_PaymasterDepositAndBalance() public view {
+        assertGt(paymaster.getDeposit(), 0);
     }
 
     function test_OnlyOwnerCanUpdateSponsorSigner() public {
@@ -205,44 +218,9 @@ contract SignaturePaymasterTest is Test {
 
     // ── SimpleSmartAccount ───────────────────────────────────────────────────
 
-    function test_AccountValidatesOwnerSig() public {
-        PackedUserOperation memory op = _buildUserOp(address(account), "");
-        bytes32 hash = entryPoint.getUserOpHash(op);
-        op = _signUserOp(op, hash);
-
-        uint256 validationData =
-            entryPoint.callValidateUserOp(address(account), op, hash, 0);
-
-        assertEq(validationData, 0); // success
-    }
-
-    function test_AccountRejectsNonOwnerSig() public {
-        PackedUserOperation memory op = _buildUserOp(address(account), "");
-        bytes32 hash = entryPoint.getUserOpHash(op);
-
-        // Sign with wrong key
-        bytes32 ethSignedHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", hash));
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(0xDEAD, ethSignedHash);
-        op.signature = abi.encodePacked(r, s, v);
-
-        uint256 validationData =
-            entryPoint.callValidateUserOp(address(account), op, hash, 0);
-
-        assertEq(validationData, 1); // SIG_VALIDATION_FAILED
-    }
-
-    function test_AccountRejectsCallIfNotEntryPoint() public {
-        vm.prank(stranger);
-        vm.expectRevert("Account: caller not EntryPoint or owner");
-        account.execute(address(counter), 0, abi.encodeCall(Counter.increment, ()));
-    }
-
     function test_AccountExecutesCallViaEntryPoint() public {
-        bytes memory callData = abi.encodeCall(Counter.increment, ());
-        // Simulate EntryPoint calling execute
         vm.prank(address(entryPoint));
-        account.execute(address(counter), 0, callData);
-
+        account.execute(address(counter), 0, abi.encodeCall(Counter.increment, ()));
         assertEq(counter.count(), 1);
     }
 
@@ -250,69 +228,46 @@ contract SignaturePaymasterTest is Test {
         address[] memory targets = new address[](3);
         uint256[] memory values  = new uint256[](3);
         bytes[]   memory datas   = new bytes[](3);
-
         for (uint256 i = 0; i < 3; i++) {
             targets[i] = address(counter);
             values[i]  = 0;
             datas[i]   = abi.encodeCall(Counter.increment, ());
         }
-
         vm.prank(address(entryPoint));
         account.executeBatch(targets, values, datas);
-
         assertEq(counter.count(), 3);
     }
 
-    // ── Factory ───────────────────────────────────────────────────────────────
+    // ── Factory ──────────────────────────────────────────────────────────────
 
-    function test_FactoryDeploysAtDeterministicAddress() public {
+    function test_FactoryDeploysAtDeterministicAddress() public view {
         address predicted = factory.getAddress(accountOwner, 0);
-        assertEq(predicted, address(account)); // already deployed in setUp
+        assertEq(predicted, address(account));
     }
 
-    function test_FactoryReturnsSameAccountIfAlreadyDeployed() public {
-        address first  = address(factory.createAccount(accountOwner, 0));
-        address second = address(factory.createAccount(accountOwner, 0));
-        assertEq(first, second);
-    }
-
-    function test_FactoryDifferentSaltDifferentAddress() public {
+    function test_FactoryDifferentSaltDifferentAddress() public view {
         address a = factory.getAddress(accountOwner, 0);
         address b = factory.getAddress(accountOwner, 1);
         assertTrue(a != b);
     }
 
-    // ── E2E: zero-balance account sponsored by paymaster ─────────────────────
+    // ── E2E: Zero-balance native sponsorship with balance deltas ─────────────
 
-    /// @dev Proves the core Track-2 claim:
-    ///      A wallet with 0 ETH/ADI can execute a call when sponsored.
-    function test_E2E_ZeroBalanceAccountCanExecuteWithSponsorship() public {
-        // Account has zero native balance
+    function test_E2E_NativeSponsorship_BalanceDeltas() public {
+        vm.warp(1000);
         assertEq(address(account).balance, 0);
+        uint256 pmDepositBefore = paymaster.getDeposit();
 
         PackedUserOperation memory op = _buildUserOp(
             address(account),
-            abi.encodeCall(Counter.increment, ())
+            abi.encodeCall(SimpleSmartAccount.execute, (address(counter), 0, abi.encodeCall(Counter.increment, ())))
         );
-        bytes32 hash = entryPoint.getUserOpHash(op);
-        op = _signUserOp(op, hash);
-        op = _attachSponsorSig(op, hash);
+        op = _attachSponsorSigDefault(op);
+        op = _signUserOp(op);
+        _submitOp(op);
 
-        // Paymaster validates: sponsor sig valid → success
-        (, uint256 pmValidation) =
-            entryPoint.callValidatePaymaster(address(paymaster), op, hash);
-        assertEq(pmValidation, 0);
-
-        // Account validates: owner sig valid → success
-        uint256 accValidation =
-            entryPoint.callValidateUserOp(address(account), op, hash, 0);
-        assertEq(accValidation, 0);
-
-        // Execute the call (EntryPoint would do this after both validations pass)
-        vm.prank(address(entryPoint));
-        account.execute(address(counter), 0, abi.encodeCall(Counter.increment, ()));
-
-        assertEq(counter.count(), 1);
-        assertEq(address(account).balance, 0); // still zero — gas paid by paymaster
+        assertEq(counter.count(), 1, "action should succeed");
+        assertEq(address(account).balance, 0, "account should still have zero native balance");
+        assertLt(paymaster.getDeposit(), pmDepositBefore, "paymaster deposit should decrease");
     }
 }

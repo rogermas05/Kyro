@@ -3,13 +3,19 @@ import { privateKeyToAccount } from 'viem/accounts'
 import { adi } from './chain'
 
 type Ethereum = { request: (args: { method: string; params?: unknown[] }) => Promise<unknown> }
-type EIP6963Detail = { info: { rdns: string }; provider: Ethereum }
+type EIP6963Detail = { info: { rdns: string; name: string; icon: string }; provider: Ethereum }
 
-// Stored when the user connects — reused by getWalletClient() synchronously.
+export type WalletProvider = {
+  name: string
+  icon: string
+  rdns: string
+  provider: Ethereum
+}
+
 let _provider: Ethereum | null = null
 
-/** Use EIP-6963 to find MetaMask specifically, falling back to window.ethereum. */
-async function getMetaMask(): Promise<Ethereum> {
+/** Discover all injected wallets via EIP-6963, plus window.ethereum as fallback. */
+export async function discoverWallets(): Promise<WalletProvider[]> {
   return new Promise(resolve => {
     const found: EIP6963Detail[] = []
     const handler = (e: Event) => found.push((e as CustomEvent<EIP6963Detail>).detail)
@@ -17,27 +23,31 @@ async function getMetaMask(): Promise<Ethereum> {
     window.dispatchEvent(new Event('eip6963:requestProvider'))
     setTimeout(() => {
       window.removeEventListener('eip6963:announceProvider', handler)
-      const mm = found.find(p => p.info.rdns === 'io.metamask')
-      if (mm) { resolve(mm.provider); return }
-      // Fall back to window.ethereum (single-wallet case)
-      const win = window as Window & { ethereum?: Ethereum }
-      if (!win.ethereum) throw new Error('MetaMask not found. Please install MetaMask.')
-      resolve(win.ethereum)
+      const wallets: WalletProvider[] = found.map(p => ({
+        name: p.info.name,
+        icon: p.info.icon,
+        rdns: p.info.rdns,
+        provider: p.provider,
+      }))
+      if (wallets.length === 0) {
+        const win = window as Window & { ethereum?: Ethereum }
+        if (win.ethereum) {
+          wallets.push({ name: 'Browser Wallet', icon: '', rdns: '', provider: win.ethereum })
+        }
+      }
+      resolve(wallets)
     }, 100)
   })
 }
 
 function getEthereum(): Ethereum {
   if (_provider) return _provider
-  // Synchronous fallback (used by getWalletClient before connectWallet is called)
   const win = window as Window & { ethereum?: Ethereum }
-  if (!win.ethereum) throw new Error('No wallet found. Please install MetaMask.')
+  if (!win.ethereum) throw new Error('No wallet found. Please install a browser wallet.')
   return win.ethereum
 }
 
-/** Switch MetaMask to the correct chain.
- *  - Anvil (31337): MetaMask has this built-in as "Localhost 8545", so just switch.
- *  - ADI Testnet (99999): custom chain — add it first if not present, then switch. */
+/** Switch the connected wallet to the correct chain. */
 async function switchToADI(ethereum: Ethereum): Promise<void> {
   const chainIdHex = '0x' + adi.id.toString(16)
 
@@ -63,29 +73,30 @@ async function switchToADI(ethereum: Ethereum): Promise<void> {
   })
 }
 
-// ── Browser wallet (Rabby / MetaMask) ────────────────────────────────────────
+// ── Browser wallet ────────────────────────────────────────────────────────────
 
-/** Force MetaMask to show the account picker, then connect the chosen account. */
+/** Force the wallet to show the account picker, then connect the chosen account. */
 export async function switchWallet(): Promise<`0x${string}`> {
-  const ethereum = await getMetaMask()
-  _provider = ethereum
-  // wallet_requestPermissions forces the account selection dialog even if already connected
+  const ethereum = getEthereum()
   await ethereum.request({ method: 'wallet_requestPermissions', params: [{ eth_accounts: {} }] })
   const accounts = (await ethereum.request({ method: 'eth_accounts' })) as string[]
   await switchToADI(ethereum)
   return accounts[0] as `0x${string}`
 }
 
-export async function connectWallet(): Promise<`0x${string}`> {
-  const ethereum = await getMetaMask()
-  _provider = ethereum
+/** Connect using a specific wallet provider (from discoverWallets) or the stored provider. */
+export async function connectWallet(wallet?: WalletProvider): Promise<`0x${string}`> {
+  let ethereum: Ethereum
+  if (wallet) {
+    ethereum = wallet.provider
+    _provider = ethereum
+  } else {
+    ethereum = getEthereum()
+  }
   const accounts = (await ethereum.request({ method: 'eth_requestAccounts' })) as string[]
   await switchToADI(ethereum)
   const account = accounts[0] as `0x${string}`
 
-  // On local Anvil: sync Anvil's nonce to match whatever the browser wallet
-  // thinks the next nonce is (it adds locally-stuck pending txs on top of the
-  // chain nonce after an Anvil restart).
   if (adi.id === 31337) {
     const pendingHex = await ethereum.request({
       method: 'eth_getTransactionCount',
@@ -97,7 +108,7 @@ export async function connectWallet(): Promise<`0x${string}`> {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ wallet: account, nonce: pendingNonce }),
-      }).catch(() => { /* non-fatal */ })
+      }).catch(() => {})
     }
   }
 

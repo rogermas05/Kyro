@@ -1,6 +1,3 @@
-// Inline ABIs for the ADI AA contracts.
-// These mirror the Solidity definitions in packages/foundry/src/aa/.
-
 export const SIGNATURE_PAYMASTER_ABI = [
   {
     type: "constructor",
@@ -44,7 +41,21 @@ export const SIGNATURE_PAYMASTER_ABI = [
   },
   {
     type: "function",
-    name: "validatePaymasterUserOp",
+    name: "sponsorSigner",
+    inputs: [],
+    outputs: [{ type: "address" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "entryPoint",
+    inputs: [],
+    outputs: [{ type: "address" }],
+    stateMutability: "view",
+  },
+  {
+    type: "function",
+    name: "getHash",
     inputs: [
       {
         name: "userOp",
@@ -61,27 +72,69 @@ export const SIGNATURE_PAYMASTER_ABI = [
           { name: "signature",          type: "bytes"   },
         ],
       },
-      { name: "userOpHash", type: "bytes32" },
-      { name: "maxCost",    type: "uint256" },
+      { name: "validUntil", type: "uint48" },
+      { name: "validAfter", type: "uint48" },
     ],
-    outputs: [
-      { name: "context",        type: "bytes"   },
-      { name: "validationData", type: "uint256" },
+    outputs: [{ type: "bytes32" }],
+    stateMutability: "view",
+  },
+] as const;
+
+export const ERC20_TOKEN_PAYMASTER_ABI = [
+  {
+    type: "constructor",
+    inputs: [
+      { name: "_entryPoint",          type: "address" },
+      { name: "_sponsorSigner",       type: "address" },
+      { name: "_token",               type: "address" },
+      { name: "_tokenPricePerNative", type: "uint256" },
+      { name: "owner_",               type: "address" },
     ],
     stateMutability: "nonpayable",
   },
   {
     type: "function",
-    name: "entryPoint",
+    name: "deposit",
     inputs: [],
-    outputs: [{ type: "address" }],
+    outputs: [],
+    stateMutability: "payable",
+  },
+  {
+    type: "function",
+    name: "getDeposit",
+    inputs: [],
+    outputs: [{ type: "uint256" }],
     stateMutability: "view",
   },
   {
     type: "function",
-    name: "sponsorSigner",
+    name: "setSponsorSigner",
+    inputs: [{ name: "newSigner", type: "address" }],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "setExchangeRate",
+    inputs: [{ name: "newRate", type: "uint256" }],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "withdrawTokens",
+    inputs: [
+      { name: "to",     type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "tokenPricePerNative",
     inputs: [],
-    outputs: [{ type: "address" }],
+    outputs: [{ type: "uint256" }],
     stateMutability: "view",
   },
 ] as const;
@@ -168,6 +221,17 @@ export const SIMPLE_SMART_ACCOUNT_ABI = [
       { name: "target", type: "address" },
       { name: "value",  type: "uint256" },
       { name: "data",   type: "bytes"   },
+    ],
+    outputs: [],
+    stateMutability: "nonpayable",
+  },
+  {
+    type: "function",
+    name: "executeBatch",
+    inputs: [
+      { name: "targets", type: "address[]" },
+      { name: "values",  type: "uint256[]" },
+      { name: "datas",   type: "bytes[]"   },
     ],
     outputs: [],
     stateMutability: "nonpayable",

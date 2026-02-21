@@ -1,12 +1,19 @@
 'use client'
 import { useState, useRef, useEffect, useCallback } from 'react'
-import { keccak256, encodePacked, parseUnits, formatUnits } from 'viem'
+import { keccak256, encodePacked, parseUnits, formatUnits, encodeFunctionData } from 'viem'
 import {
   getPublicClient, getWalletClient,
 } from '../../lib/wallet'
 import { ORCHESTRATOR_ABI, ERC20_ABI, IDENTITY_REGISTRY_ABI } from '../../lib/abis'
 import { adi } from '../../lib/chain'
 import { useWallet } from '../context/WalletContext'
+import {
+  sendSponsoredUserOp,
+  encodeExecute,
+  buildInitCode,
+  ENTRY_POINT,
+  FACTORY,
+} from '../../lib/smart-account'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -101,7 +108,7 @@ function stateLabel(state: InvoiceItem['state']): string {
 
 export default function SMEPage() {
   // Core state
-  const { account } = useWallet()
+  const { account, smartAccount, smartAccountDeployed, refreshSmartAccount } = useWallet()
   const [step, setStep]                 = useState<'form' | 'attesting' | 'review' | 'minting' | 'done'>('form')
   const [status, setStatus]             = useState<{ msg: string; type: 'info' | 'success' | 'error' } | null>(null)
   const [attestation, setAttestation]   = useState<Attestation | null>(null)
@@ -156,31 +163,43 @@ export default function SMEPage() {
   }, [invoiceNumber, faceValue, dueDate, buyerName, buyerWallet])
 
   // Features 7,8,9,11: Load dashboard data whenever account changes
-  const loadDashboard = useCallback(async (acct: `0x${string}`) => {
+  const loadDashboard = useCallback(async (acct: `0x${string}`, smartAcct?: `0x${string}`) => {
     setDashboardLoading(true)
     const pub = getPublicClient()
+    const primaryAddr = smartAcct ?? acct
     try {
-      // Feature 7: DDSC balance
+      // Feature 7: DDSC balance (check both EOA and smart account)
       if (DDSC_ADDR !== ZERO) {
-        const bal = await pub.readContract({ address: DDSC_ADDR, abi: ERC20_ABI, functionName: 'balanceOf', args: [acct] })
+        let bal = await pub.readContract({ address: DDSC_ADDR, abi: ERC20_ABI, functionName: 'balanceOf', args: [acct] })
+        if (smartAcct && smartAcct !== acct) {
+          const saBal = await pub.readContract({ address: DDSC_ADDR, abi: ERC20_ABI, functionName: 'balanceOf', args: [smartAcct] })
+          bal = bal + saBal
+        }
         setDdscBalance(bal)
       }
 
       // Feature 8: Junior (J-DEBT) balance
       if (JUNIOR_ADDR !== ZERO) {
-        const bal = await pub.readContract({ address: JUNIOR_ADDR, abi: ERC20_ABI, functionName: 'balanceOf', args: [acct] })
+        let bal = await pub.readContract({ address: JUNIOR_ADDR, abi: ERC20_ABI, functionName: 'balanceOf', args: [primaryAddr] })
+        if (smartAcct && smartAcct !== acct) {
+          const eoBal = await pub.readContract({ address: JUNIOR_ADDR, abi: ERC20_ABI, functionName: 'balanceOf', args: [acct] })
+          bal = bal + eoBal
+        }
         setJuniorBalance(bal)
       }
 
-      // Feature 9: KYC status
+      // Feature 9: KYC status (verified if either address is verified)
       if (IDENTITY_REG !== ZERO) {
-        const verified = await pub.readContract({ address: IDENTITY_REG, abi: IDENTITY_REGISTRY_ABI, functionName: 'isVerified', args: [acct] })
+        let verified = await pub.readContract({ address: IDENTITY_REG, abi: IDENTITY_REGISTRY_ABI, functionName: 'isVerified', args: [acct] })
+        if (!verified && smartAcct && smartAcct !== acct) {
+          verified = await pub.readContract({ address: IDENTITY_REG, abi: IDENTITY_REGISTRY_ABI, functionName: 'isVerified', args: [smartAcct] })
+        }
         setKycVerified(verified)
       }
 
-      // Features 3,4,5,6: My Invoices
+      // Features 3,4,5,6: My Invoices (query both EOA and smart account)
       if (ORCHESTRATOR !== ZERO) {
-        const mintedEvts = await pub.getContractEvents({
+        const eoaEvts = await pub.getContractEvents({
           address:   ORCHESTRATOR,
           abi:       ORCHESTRATOR_ABI,
           eventName: 'InvoiceMinted',
@@ -188,6 +207,18 @@ export default function SMEPage() {
           fromBlock: 0n,
           toBlock:   'latest',
         })
+        let mintedEvts = eoaEvts
+        if (smartAcct && smartAcct !== acct) {
+          const saEvts = await pub.getContractEvents({
+            address:   ORCHESTRATOR,
+            abi:       ORCHESTRATOR_ABI,
+            eventName: 'InvoiceMinted',
+            args:      { sme: smartAcct },
+            fromBlock: 0n,
+            toBlock:   'latest',
+          })
+          mintedEvts = [...eoaEvts, ...saEvts]
+        }
 
         if (mintedEvts.length > 0) {
           // Get all settled / defaulted events to cross-reference
@@ -259,14 +290,14 @@ export default function SMEPage() {
 
   useEffect(() => {
     if (account) {
-      loadDashboard(account)
+      loadDashboard(account, smartAccount ?? undefined)
     } else {
       setDdscBalance(null)
       setJuniorBalance(null)
       setKycVerified(null)
       setMyInvoices([])
     }
-  }, [account, loadDashboard])
+  }, [account, smartAccount, loadDashboard])
 
   // Reset form state when wallet disconnects
   useEffect(() => {
@@ -306,14 +337,24 @@ export default function SMEPage() {
   async function doAttest() {
     setDupWarn(null)
     setStep('attesting')
-    setStatus({ msg: 'Registering wallet with KYC registry…', type: 'info' })
+    setStatus({ msg: 'Registering smart account with KYC registry…', type: 'info' })
 
     try {
+      // Register BOTH the EOA and the smart account for KYC
+      const registerWallet = smartAccount ?? account
       await fetch('/api/register-sme', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: account }),
+        body: JSON.stringify({ wallet: registerWallet }),
       })
+      // Also register EOA as fallback
+      if (smartAccount && smartAccount !== account) {
+        await fetch('/api/register-sme', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ wallet: account }),
+        })
+      }
 
       setStatus({ msg: 'Requesting oracle attestation…', type: 'info' })
 
@@ -322,11 +363,13 @@ export default function SMEPage() {
       const docHash = file ? await hashFile(file) : hashMetadata(invoiceNumber, faceValue, dueDate)
       const buyer   = (buyerWallet.startsWith('0x') ? buyerWallet : ZERO) as `0x${string}`
 
+      // Use smart account address as the wallet for attestation if available
+      const attestWallet = smartAccount ?? account
       const res = await fetch('/api/attest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          walletAddress: account,
+          walletAddress: attestWallet,
           invoiceNumber: invoiceNumber.trim(),
           faceValue:     faceWei.toString(),
           dueSecs:       dueSecs.toString(),
@@ -367,19 +410,53 @@ export default function SMEPage() {
       const walletClient = getWalletClient(account)
       const pubClient    = getPublicClient()
 
-      const hash = await walletClient.writeContract({
-        address:      ORCHESTRATOR,
-        abi:          ORCHESTRATOR_ABI,
-        functionName: 'mintInvoice',
-        args: [
-          attestation.invoiceId,
-          attestation.faceWei,
-          attestation.dueSecs,
-          attestation.docHash,
-          attestation.buyerWallet,
-          attestation.proof,
-        ],
-      })
+      let hash: `0x${string}`
+
+      const useAA = smartAccount && ENTRY_POINT !== '0x0000000000000000000000000000000000000000'
+
+      if (useAA) {
+        // Gas-sponsored flow via smart account UserOp
+        setStatus({ msg: 'Building sponsored UserOperation…', type: 'info' })
+
+        const mintCalldata = encodeFunctionData({
+          abi: ORCHESTRATOR_ABI,
+          functionName: 'mintInvoice',
+          args: [
+            attestation.invoiceId,
+            attestation.faceWei,
+            attestation.dueSecs,
+            attestation.docHash,
+            attestation.buyerWallet,
+            attestation.proof,
+          ],
+        })
+
+        const executeCalldata = encodeExecute(ORCHESTRATOR, 0n, mintCalldata)
+        const initCode = !smartAccountDeployed ? buildInitCode(account) : undefined
+
+        hash = await sendSponsoredUserOp(
+          pubClient,
+          walletClient,
+          smartAccount!,
+          executeCalldata,
+          initCode
+        )
+      } else {
+        // Direct EOA call (fallback when AA is not configured)
+        hash = await walletClient.writeContract({
+          address:      ORCHESTRATOR,
+          abi:          ORCHESTRATOR_ABI,
+          functionName: 'mintInvoice',
+          args: [
+            attestation.invoiceId,
+            attestation.faceWei,
+            attestation.dueSecs,
+            attestation.docHash,
+            attestation.buyerWallet,
+            attestation.proof,
+          ],
+        })
+      }
 
       setStatus({ msg: 'Transaction submitted, confirming…', type: 'info' })
       const receipt = await pubClient.waitForTransactionReceipt({ hash, timeout: 60_000 })
@@ -390,7 +467,11 @@ export default function SMEPage() {
         return
       }
 
-      // Feature 14: Persist invoice details to localStorage for dashboard
+      // Refresh smart account deployment status after first use
+      if (useAA && !smartAccountDeployed) {
+        refreshSmartAccount()
+      }
+
       try {
         const stored: StoredInvoice = {
           invoiceId:     attestation.invoiceId,
@@ -400,15 +481,14 @@ export default function SMEPage() {
         }
         localStorage.setItem(`sme_inv_${attestation.invoiceId}`, JSON.stringify(stored))
 
-        // Feature 17: Track submitted invoice numbers per wallet (duplicate detection)
-        const dupKey = `sme_submitted_${account.toLowerCase()}`
+        const senderAddr = (smartAccount ?? account).toLowerCase()
+        const dupKey = `sme_submitted_${senderAddr}`
         const nums   = JSON.parse(localStorage.getItem(dupKey) ?? '[]') as string[]
         if (!nums.includes(attestation.invoiceNumber)) {
           nums.push(attestation.invoiceNumber)
           localStorage.setItem(dupKey, JSON.stringify(nums))
         }
 
-        // Clear the form draft since this invoice is now submitted
         localStorage.removeItem('sme_form_draft')
       } catch { /* ignore */ }
 
@@ -416,17 +496,13 @@ export default function SMEPage() {
       setStep('done')
       setStatus(null)
 
-      // Reload dashboard to reflect the new invoice
-      loadDashboard(account)
+      loadDashboard(account, smartAccount ?? undefined)
 
-      // Auto-fund: vault protocol automatically purchases the senior tranche.
-      // Fire-and-forget — if the vault has liquidity it succeeds silently;
-      // if not, the invoice stays PENDING and the SME sees it in their dashboard.
       fetch('/api/fund-tranche', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ invoiceId: attestation.invoiceId }),
-      }).then(() => loadDashboard(account)).catch(() => {})
+      }).then(() => loadDashboard(account, smartAccount ?? undefined)).catch(() => {})
     } catch (e: unknown) {
       setStep('review')
       setStatus({ msg: (e as Error).message, type: 'error' })
@@ -438,20 +514,34 @@ export default function SMEPage() {
     if (!account) return
     setInvAction(invoiceId)
     try {
-      // Step 1: SME wallet sends faceValue DDSC to the orchestrator (simulating buyer repayment)
       const walletClient = getWalletClient(account)
       const pub = getPublicClient()
-      setStatus({ msg: 'Waiting for wallet — transfer DDSC to orchestrator…', type: 'info' })
-      const transferHash = await walletClient.writeContract({
-        address: DDSC_ADDR,
-        abi: ERC20_ABI,
-        functionName: 'transfer',
-        args: [ORCHESTRATOR, faceValue],
-      })
-      const transferReceipt = await pub.waitForTransactionReceipt({ hash: transferHash })
-      if (transferReceipt.status === 'reverted') throw new Error('DDSC transfer reverted — check your balance')
 
-      // Step 2: Oracle (server) calls settleInvoice, which forwards DDSC to vault
+      const useAA = smartAccount && ENTRY_POINT !== '0x0000000000000000000000000000000000000000'
+
+      if (useAA) {
+        setStatus({ msg: 'Building sponsored DDSC transfer…', type: 'info' })
+        const transferData = encodeFunctionData({
+          abi: ERC20_ABI,
+          functionName: 'transfer',
+          args: [ORCHESTRATOR, faceValue],
+        })
+        const callData = encodeExecute(DDSC_ADDR, 0n, transferData)
+        const txHash = await sendSponsoredUserOp(pub, walletClient, smartAccount!, callData)
+        const receipt = await pub.waitForTransactionReceipt({ hash: txHash })
+        if (receipt.status === 'reverted') throw new Error('DDSC transfer reverted — check your balance')
+      } else {
+        setStatus({ msg: 'Waiting for wallet — transfer DDSC to orchestrator…', type: 'info' })
+        const transferHash = await walletClient.writeContract({
+          address: DDSC_ADDR,
+          abi: ERC20_ABI,
+          functionName: 'transfer',
+          args: [ORCHESTRATOR, faceValue],
+        })
+        const transferReceipt = await pub.waitForTransactionReceipt({ hash: transferHash })
+        if (transferReceipt.status === 'reverted') throw new Error('DDSC transfer reverted — check your balance')
+      }
+
       setStatus({ msg: 'Settling invoice on-chain…', type: 'info' })
       const res  = await fetch('/api/settle-invoice', {
         method:  'POST',
@@ -461,7 +551,7 @@ export default function SMEPage() {
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? 'Settle failed')
       setStatus({ msg: 'Invoice settled — funds forwarded to vault.', type: 'success' })
-      await loadDashboard(account)
+      await loadDashboard(account, smartAccount ?? undefined)
     } catch (e: unknown) {
       setStatus({ msg: (e as Error).message, type: 'error' })
     } finally {
@@ -481,7 +571,7 @@ export default function SMEPage() {
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? 'Default failed')
-      await loadDashboard(account)
+      await loadDashboard(account, smartAccount ?? undefined)
     } catch (e: unknown) {
       setStatus({ msg: (e as Error).message, type: 'error' })
     } finally {
@@ -568,10 +658,22 @@ export default function SMEPage() {
                 J-DEBT <span style={{ fontFamily: 'JetBrains Mono, monospace', color: 'var(--orange)', fontWeight: 600 }}>{fmtDDSC(juniorBalance)}</span>
               </span>
             )}
-            <button className="btn btn-ghost btn-sm" onClick={() => loadDashboard(account)} disabled={dashboardLoading} style={{ marginTop: 0, marginLeft: 'auto' }}>
+            <button className="btn btn-ghost btn-sm" onClick={() => loadDashboard(account, smartAccount ?? undefined)} disabled={dashboardLoading} style={{ marginTop: 0, marginLeft: 'auto' }}>
               {dashboardLoading ? '⟳' : '↻'}
             </button>
           </div>
+          {smartAccount && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', padding: '0.4rem 1rem', borderTop: '1px solid rgba(61,207,142,0.15)', background: 'rgba(61,207,142,0.04)', fontSize: '0.71rem' }}>
+              <span style={{ color: 'var(--success)', fontWeight: 700 }}>Smart Account</span>
+              <span style={{ fontFamily: 'JetBrains Mono, monospace', color: '#7fbadc', fontSize: '0.68rem' }}>{fmtAddr(smartAccount)}</span>
+              <span style={{ fontSize: '0.6rem', fontWeight: 600, color: smartAccountDeployed ? 'var(--success)' : 'var(--orange)', background: smartAccountDeployed ? 'rgba(61,207,142,0.12)' : 'rgba(244,120,32,0.1)', border: `1px solid ${smartAccountDeployed ? 'rgba(61,207,142,0.3)' : 'rgba(244,120,32,0.3)'}`, borderRadius: 4, padding: '0.1rem 0.35rem' }}>
+                {smartAccountDeployed ? 'Deployed' : 'Counterfactual'}
+              </span>
+              <span style={{ marginLeft: 'auto', fontSize: '0.6rem', fontWeight: 700, color: 'var(--success)', background: 'rgba(61,207,142,0.12)', border: '1px solid rgba(61,207,142,0.3)', borderRadius: 4, padding: '0.1rem 0.35rem' }}>
+                Gas Sponsored
+              </span>
+            </div>
+          )}
           <div style={{ padding: '0.45rem 1rem', background: 'rgba(244,120,32,0.05)', borderTop: '1px solid rgba(244,120,32,0.15)', fontSize: '0.71rem', color: 'var(--muted)' }}>
             <span style={{ color: 'var(--orange)', fontWeight: 600 }}>⚑ Testnet —</span>{' '}
             KYC auto-approved · Oracle signs any request · You simulate buyer repayment from your own wallet

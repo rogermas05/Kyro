@@ -4,42 +4,24 @@ import {
   type Address,
   createWalletClient,
   http,
-  keccak256,
-  toBytes,
-  concat,
-  pad,
-  toHex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { adiTestnet } from "../lib/chain.js";
-
-/**
- * Compute the sponsor-signed hash:
- *   keccak256("\x19Ethereum Signed Message:\n32" || keccak256(userOpHash || chainId || paymaster))
- */
-function buildEthSignedSponsorHash(
-  userOpHash: Hex,
-  chainId: number,
-  paymaster: Address
-): Uint8Array {
-  // inner hash: keccak256(abi.encodePacked(userOpHash, chainId, paymaster))
-  const packed = concat([
-    userOpHash,
-    pad(toHex(BigInt(chainId)), { size: 32 }),
-    paymaster,
-  ]);
-  const innerHash = keccak256(packed);
-
-  // eth_sign prefix
-  const prefix = toBytes("\x19Ethereum Signed Message:\n32");
-  return concat([prefix, toBytes(innerHash)]);
-}
+import {
+  computePaymasterHash,
+  computeERC20PaymasterHash,
+  buildNativePaymasterAndData,
+  buildERC20PaymasterAndData,
+  type PackedUserOperation,
+} from "../lib/userop.js";
 
 export interface SponsorSignOptions {
   sponsorKey: string;
   paymaster:  string;
   chainId:    number;
   port:       number;
+  entryPoint: string;
+  validitySeconds: number;
   rpc?:       string;
 }
 
@@ -54,60 +36,90 @@ export async function sponsorSign(opts: SponsorSignOptions): Promise<void> {
   const app = express();
   app.use(express.json());
 
-  console.log(`\n✍️  Sponsor Signer: ${account.address}`);
-  console.log(`📍 Paymaster:       ${opts.paymaster}`);
-  console.log(`🌐 Chain ID:        ${opts.chainId}`);
-  console.log(`\n🚀 Sponsor service listening on http://localhost:${opts.port}\n`);
+  console.log(`\n  Sponsor Signer: ${account.address}`);
+  console.log(`  Paymaster:       ${opts.paymaster}`);
+  console.log(`  EntryPoint:      ${opts.entryPoint}`);
+  console.log(`  Chain ID:        ${opts.chainId}`);
+  console.log(`  Validity:        ${opts.validitySeconds}s`);
+  console.log(`\n  Sponsor service listening on http://localhost:${opts.port}\n`);
 
   /**
    * POST /sign
-   * Body: { userOpHash: "0x..." }
-   * Response: { signature: "0x...", paymasterAndData: "0x..." }
-   *
-   * The signature covers: keccak256(userOpHash || chainId || paymaster)
-   * This is verified on-chain by SignaturePaymaster.validatePaymasterUserOp()
+   * Body: { userOp: PackedUserOperation, paymasterType?: "native" | "erc20", maxTokenCost?: string }
+   * Response: { paymasterAndData, validUntil, validAfter }
    */
   app.post("/sign", async (req, res) => {
-    const { userOpHash } = req.body as { userOpHash?: string };
+    const { userOp, paymasterType = "native", maxTokenCost } = req.body as {
+      userOp?: PackedUserOperation;
+      paymasterType?: "native" | "erc20";
+      maxTokenCost?: string;
+    };
 
-    if (!userOpHash || !userOpHash.startsWith("0x")) {
-      res.status(400).json({ error: "Missing or invalid userOpHash" });
+    if (!userOp || !userOp.sender) {
+      res.status(400).json({ error: "Missing userOp" });
       return;
     }
 
     try {
-      // Sign the combined hash off-chain
-      const signature = await walletClient.signMessage({
-        message: {
-          raw: keccak256(
-            concat([
-              userOpHash as Hex,
-              pad(toHex(BigInt(opts.chainId)), { size: 32 }),
-              opts.paymaster as Address,
-            ])
-          ),
-        },
-      });
+      const now = Math.floor(Date.now() / 1000);
+      const validAfter = now;
+      const validUntil = now + opts.validitySeconds;
 
-      // Build paymasterAndData: [paymaster 20B][verGasLimit 16B][postOpGasLimit 16B][sig 65B]
-      const verGasLimit    = pad(toHex(100_000n), { size: 16 });
-      const postOpGasLimit = pad(toHex(50_000n),  { size: 16 });
-      const paymasterAndData = concat([
-        opts.paymaster as Hex,
-        verGasLimit,
-        postOpGasLimit,
-        signature,
-      ]);
+      let hash: Hex;
+      let paymasterAndData: Hex;
 
-      console.log(`  ✅ Signed userOpHash ${userOpHash.slice(0, 12)}...`);
-      res.json({ signature, paymasterAndData });
+      if (paymasterType === "erc20" && maxTokenCost) {
+        hash = computeERC20PaymasterHash(
+          userOp,
+          opts.chainId,
+          opts.entryPoint as Address,
+          opts.paymaster as Address,
+          validUntil,
+          validAfter,
+          BigInt(maxTokenCost)
+        );
+
+        const signature = await walletClient.signMessage({
+          message: { raw: hash },
+        });
+
+        paymasterAndData = buildERC20PaymasterAndData(
+          opts.paymaster as Address,
+          validUntil,
+          validAfter,
+          BigInt(maxTokenCost),
+          signature
+        );
+      } else {
+        hash = computePaymasterHash(
+          userOp,
+          opts.chainId,
+          opts.entryPoint as Address,
+          opts.paymaster as Address,
+          validUntil,
+          validAfter
+        );
+
+        const signature = await walletClient.signMessage({
+          message: { raw: hash },
+        });
+
+        paymasterAndData = buildNativePaymasterAndData(
+          opts.paymaster as Address,
+          validUntil,
+          validAfter,
+          signature
+        );
+      }
+
+      console.log(`  Signed for ${userOp.sender.slice(0, 12)}... [${paymasterType}]`);
+      res.json({ paymasterAndData, validUntil, validAfter });
     } catch (err) {
-      console.error("  ❌ Signing error:", err);
+      console.error("  Signing error:", err);
       res.status(500).json({ error: "Signing failed", detail: String(err) });
     }
   });
 
-  /** GET /health — liveness check */
   app.get("/health", (_req, res) => {
     res.json({ status: "ok", signer: account.address, paymaster: opts.paymaster });
   });

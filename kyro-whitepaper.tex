@@ -79,8 +79,9 @@ Kyro is an on-chain trade finance protocol that converts real-world invoices int
 instruments on ADI Chain. SMEs tokenize invoices to receive instant stablecoin liquidity;
 institutional investors deposit into an ERC-4626 vault and earn real yield as invoices settle.
 The protocol enforces KYC at the token-transfer level via an on-chain identity registry,
-structures each invoice into senior (80\%) and junior (20\%) tranches, and uses account
-abstraction to remove wallet complexity for non-crypto-native users. This document describes
+structures each invoice into senior (80\%) and junior (20\%) tranches, and includes a
+deployed ERC-4337 account abstraction layer designed to remove wallet and gas complexity
+for non-crypto-native users. This document describes
 the architecture deployed on the ADI testnet.
 \end{abstract}
 
@@ -101,7 +102,8 @@ Kyro solves both problems: SMEs tokenize invoices and receive DDSC (UAE Dirham s
 within a single block; investors earn real yield as those invoices are repaid. Three principles
 govern the design: \textbf{compliance-first} (KYC enforced at the EVM level, not the application
 layer); \textbf{standard interfaces} (ERC-20, ERC-721, ERC-4626, ERC-4337 throughout); and
-\textbf{simplicity for end users} (account abstraction removes wallet and gas friction).
+\textbf{simplicity for end users} (ERC-4337 account abstraction is built to remove
+wallet and gas friction, with paymaster integration planned for production).
 
 % ══════════════════════════════════════════════════════════════════════════════
 \section{System Architecture}
@@ -195,13 +197,17 @@ investors may receive or transfer shares. DDSC itself is unrestricted.
 
 \subsection{Layer 4 — Account Abstraction}
 
-SMEs interact through \texttt{SimpleSmartAccount}, a deterministic (CREATE2) smart contract
-wallet. A \texttt{SignaturePaymaster} sponsors all gas costs so users never need native ADI
-tokens. The \texttt{SimpleSmartAccountFactory} computes wallet addresses before deployment,
-allowing compliance agents to KYC-register an address before the wallet is deployed.
+The ERC-4337 contract suite is fully deployed: \texttt{SimpleSmartAccount} (deterministic
+CREATE2 wallet, ECDSA-validated), \texttt{SimpleSmartAccountFactory} (computes wallet
+addresses before deployment so compliance agents can KYC-register an address ahead of
+its first use), \texttt{SignaturePaymaster} (sponsors gas on behalf of approved accounts),
+and \texttt{MinimalEntryPoint} (coordinates UserOp validation and execution).
 
-Batched calls are supported: a single user operation can encode, e.g., a DDSC approval
-followed by an invoice mint, atomically — if the mint fails, the approval is also reverted.
+On the current testnet deployment, the frontend uses standard MetaMask EOA wallets rather
+than smart accounts — users sign transactions directly and pay gas in ADI. The account
+abstraction layer is architectural infrastructure ready for integration: connecting the
+paymaster would allow SMEs to interact without holding native ADI tokens, and batched
+UserOps would make multi-step flows (e.g., approve + mintInvoice) atomic.
 
 \subsection{Merchant Module — KyroPay}
 
@@ -218,8 +224,9 @@ A QR code workflow encodes the full checkout configuration for mobile wallets.
   \item \textbf{KYC.} Compliance agent registers the SME and investor wallets in
     \texttt{IdentityRegistry}.
   \item \textbf{Invoice Minting.} SME submits an invoice form. The frontend calls the
-    attestation API (oracle signs the invoice digest), then the SME's wallet calls
-    \texttt{mintInvoice()}. The SME receives J-DEBT (20\% of face value). Invoice is PENDING.
+    attestation API (oracle signs the invoice digest), then the SME's MetaMask wallet
+    signs and sends a \texttt{mintInvoice()} transaction (gas paid in ADI). The SME
+    receives J-DEBT (20\% of face value). Invoice is PENDING.
   \item \textbf{Investor Deposit.} Institution calls \texttt{vault.deposit(DDSC, amount)}.
     Vault mints shares at the current share price.
   \item \textbf{Tranche Purchase.} Vault operator calls \texttt{purchaseSeniorTranche()}.
@@ -296,8 +303,8 @@ each layer can be independently upgraded, audited, and composed with other DeFi 
 
 The protocol achieves compliance without centralization (KYC at the token level),
 privacy without opacity (only document hashes on-chain), yield without complexity
-(automatic ERC-4626 share price appreciation), and simplicity without insecurity
-(ERC-4337 abstraction over a full cryptographic security model).
+(automatic ERC-4626 share price appreciation), and a deployed ERC-4337 layer ready
+to abstract wallet and gas complexity for non-crypto-native users.
 
 The testnet deployment is a functional end-to-end proof of concept. The architecture
 is designed to accommodate production-grade oracle integrations, multi-jurisdiction

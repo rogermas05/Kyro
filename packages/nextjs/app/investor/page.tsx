@@ -1,9 +1,16 @@
 'use client'
 import { useState, useEffect } from 'react'
-import { formatUnits, parseUnits } from 'viem'
+import { formatUnits, parseUnits, encodeFunctionData } from 'viem'
 import { getPublicClient, getWalletClient } from '../../lib/wallet'
 import { VAULT_ABI, ERC20_ABI, ORCHESTRATOR_ABI } from '../../lib/abis'
 import { useWallet } from '../context/WalletContext'
+import {
+  sendSponsoredUserOp,
+  encodeExecute,
+  encodeExecuteBatch,
+  buildInitCode,
+  ENTRY_POINT,
+} from '../../lib/smart-account'
 
 const VAULT         = (process.env.NEXT_PUBLIC_VAULT_ADDRESS         ?? '0x0000000000000000000000000000000000000000') as `0x${string}`
 const DDSC          = (process.env.NEXT_PUBLIC_DDSC_ADDRESS          ?? '0x0000000000000000000000000000000000000000') as `0x${string}`
@@ -56,7 +63,7 @@ function Sparkline({ points, positive }: { points: number[]; positive: boolean }
 }
 
 export default function InvestorPage() {
-  const { account } = useWallet()
+  const { account, smartAccount, smartAccountDeployed, refreshSmartAccount } = useWallet()
   const [stats,       setStats]      = useState<Stats | null>(null)
   const [sparkPoints, setSparkPoints] = useState<number[]>([])
   const [depositAmt,  setDepositAmt] = useState('1000')
@@ -64,7 +71,7 @@ export default function InvestorPage() {
   const [status,      setStatus]     = useState<{ msg: string; type: 'info' | 'success' | 'error' } | null>(null)
   const [minting,     setMinting]    = useState(false)
 
-  async function loadStats(acct?: `0x${string}`) {
+  async function loadStats(acct?: `0x${string}`, smartAcct?: `0x${string}`) {
     if (VAULT === ZERO) return
     try {
       const pub = getPublicClient()
@@ -79,6 +86,14 @@ export default function InvestorPage() {
           pub.readContract({ address: VAULT, abi: VAULT_ABI, functionName: 'balanceOf', args: [acct] }),
           pub.readContract({ address: DDSC,  abi: ERC20_ABI, functionName: 'balanceOf', args: [acct] }),
         ])
+        if (smartAcct && smartAcct !== acct) {
+          const [saShares, saDDSC] = await Promise.all([
+            pub.readContract({ address: VAULT, abi: VAULT_ABI, functionName: 'balanceOf', args: [smartAcct] }),
+            pub.readContract({ address: DDSC,  abi: ERC20_ABI, functionName: 'balanceOf', args: [smartAcct] }),
+          ])
+          myShares += saShares
+          ddscBalance += saDDSC
+        }
         myDDSC = myShares > 0n
           ? await pub.readContract({ address: VAULT, abi: VAULT_ABI, functionName: 'convertToAssets', args: [myShares] })
           : 0n
@@ -112,24 +127,25 @@ export default function InvestorPage() {
   useEffect(() => { loadStats() }, [])
 
   useEffect(() => {
-    if (account) loadStats(account)
-  }, [account])
+    if (account) loadStats(account, smartAccount ?? undefined)
+  }, [account, smartAccount])
 
   // ── Mint DDSC (local dev only) ─────────────────────────────────────────────
 
   async function handleMintDDSC() {
     if (!account) return setStatus({ msg: 'Connect wallet first.', type: 'error' })
     setMinting(true)
+    const mintTarget = smartAccount ?? account
     setStatus({ msg: `Minting ${Number(mintAmt).toLocaleString()} DDSC…`, type: 'info' })
     try {
       const res  = await fetch('/api/mint-ddsc', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ address: account, amount: mintAmt }),
+        body: JSON.stringify({ address: mintTarget, amount: mintAmt }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? 'Mint failed')
-      setStatus({ msg: `Minted ${Number(mintAmt).toLocaleString()} DDSC to your wallet.`, type: 'success' })
-      await loadStats(account)
+      setStatus({ msg: `Minted ${Number(mintAmt).toLocaleString()} DDSC.`, type: 'success' })
+      await loadStats(account, smartAccount ?? undefined)
     } catch (e: unknown) {
       setStatus({ msg: (e as Error).message, type: 'error' })
     } finally {
@@ -144,30 +160,60 @@ export default function InvestorPage() {
     if (VAULT === ZERO) return setStatus({ msg: 'NEXT_PUBLIC_VAULT_ADDRESS not set.', type: 'error' })
     setStatus({ msg: 'Registering with KYC registry…', type: 'info' })
     try {
-      // Auto-KYC: vault.deposit() gates on isVerified(receiver)
+      const registerAddr = smartAccount ?? account
       await fetch('/api/register-sme', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ wallet: account }),
+        body: JSON.stringify({ wallet: registerAddr }),
       })
+      if (smartAccount && smartAccount !== account) {
+        await fetch('/api/register-sme', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ wallet: account }),
+        })
+      }
 
       const amount = parseUnits(depositAmt, 18)
       const wallet = getWalletClient(account)
       const pub    = getPublicClient()
 
-      setStatus({ msg: 'Approving DDSC…', type: 'info' })
-      const approveTx = await wallet.writeContract({
-        address: DDSC, abi: ERC20_ABI, functionName: 'approve', args: [VAULT, amount],
-      })
-      await pub.waitForTransactionReceipt({ hash: approveTx })
+      const useAA = smartAccount && ENTRY_POINT !== '0x0000000000000000000000000000000000000000'
 
-      setStatus({ msg: 'Depositing into vault…', type: 'info' })
-      const depositTx = await wallet.writeContract({
-        address: VAULT, abi: VAULT_ABI, functionName: 'deposit', args: [amount, account],
-      })
-      await pub.waitForTransactionReceipt({ hash: depositTx })
+      if (useAA) {
+        // Batch approve+deposit in a single sponsored UserOp
+        setStatus({ msg: 'Building sponsored approve+deposit batch…', type: 'info' })
+
+        const approveData = encodeFunctionData({
+          abi: ERC20_ABI, functionName: 'approve', args: [VAULT, amount],
+        })
+        const depositData = encodeFunctionData({
+          abi: VAULT_ABI, functionName: 'deposit', args: [amount, smartAccount!],
+        })
+
+        const callData = encodeExecuteBatch(
+          [DDSC, VAULT],
+          [0n, 0n],
+          [approveData, depositData]
+        )
+        const initCode = !smartAccountDeployed ? buildInitCode(account) : undefined
+        const txHash = await sendSponsoredUserOp(pub, wallet, smartAccount!, callData, initCode)
+        await pub.waitForTransactionReceipt({ hash: txHash })
+        if (!smartAccountDeployed) refreshSmartAccount()
+      } else {
+        setStatus({ msg: 'Approving DDSC…', type: 'info' })
+        const approveTx = await wallet.writeContract({
+          address: DDSC, abi: ERC20_ABI, functionName: 'approve', args: [VAULT, amount],
+        })
+        await pub.waitForTransactionReceipt({ hash: approveTx })
+
+        setStatus({ msg: 'Depositing into vault…', type: 'info' })
+        const depositTx = await wallet.writeContract({
+          address: VAULT, abi: VAULT_ABI, functionName: 'deposit', args: [amount, account],
+        })
+        await pub.waitForTransactionReceipt({ hash: depositTx })
+      }
 
       setStatus({ msg: `Deposit complete. You now hold KYRO vault shares — yield accrues automatically as invoices settle.`, type: 'success' })
-      await loadStats(account)
+      await loadStats(account, smartAccount ?? undefined)
     } catch (e: unknown) {
       setStatus({ msg: (e as Error).message, type: 'error' })
     }
@@ -181,13 +227,28 @@ export default function InvestorPage() {
     try {
       const wallet = getWalletClient(account)
       const pub    = getPublicClient()
-      const hash   = await wallet.writeContract({
-        address: VAULT, abi: VAULT_ABI, functionName: 'redeem',
-        args: [stats.myShares, account, account],
-      })
-      await pub.waitForTransactionReceipt({ hash })
+
+      const useAA = smartAccount && ENTRY_POINT !== '0x0000000000000000000000000000000000000000'
+      const receiver = useAA ? smartAccount! : account
+
+      if (useAA) {
+        const redeemData = encodeFunctionData({
+          abi: VAULT_ABI, functionName: 'redeem',
+          args: [stats.myShares, receiver, receiver],
+        })
+        const callData = encodeExecute(VAULT, 0n, redeemData)
+        const txHash = await sendSponsoredUserOp(pub, wallet, smartAccount!, callData)
+        await pub.waitForTransactionReceipt({ hash: txHash })
+      } else {
+        const hash = await wallet.writeContract({
+          address: VAULT, abi: VAULT_ABI, functionName: 'redeem',
+          args: [stats.myShares, account, account],
+        })
+        await pub.waitForTransactionReceipt({ hash })
+      }
+
       setStatus({ msg: `Redemption complete — DDSC returned to your wallet.`, type: 'success' })
-      await loadStats(account)
+      await loadStats(account, smartAccount ?? undefined)
     } catch (e: unknown) {
       setStatus({ msg: (e as Error).message, type: 'error' })
     }
@@ -327,7 +388,7 @@ export default function InvestorPage() {
         <div className="card" style={{ margin: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.25rem' }}>
             <h2 style={{ margin: 0 }}>Vault</h2>
-            <button className="btn btn-ghost btn-sm" onClick={() => loadStats(account ?? undefined)} style={{ marginTop: 0 }}>↻</button>
+            <button className="btn btn-ghost btn-sm" onClick={() => loadStats(account ?? undefined, smartAccount ?? undefined)} style={{ marginTop: 0 }}>↻</button>
           </div>
 
           {/* Share price row */}

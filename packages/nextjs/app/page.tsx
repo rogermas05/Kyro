@@ -310,7 +310,7 @@ export default function HomePage() {
           Stop waiting to get paid.
         </h2>
         <p style={{ color: 'var(--text-2)', marginBottom: '2.5rem', fontSize: '0.95rem' }}>
-          Kyro turns outstanding invoices into instant liquidity — live on ADI Testnet. Connect MetaMask and try it yourself.
+          Kyro turns outstanding invoices into instant liquidity — live on ADI Testnet. Connect your wallet and try it yourself.
         </p>
         <div style={{ display: 'flex', gap: '1rem', justifyContent: 'center', flexWrap: 'wrap' }}>
           <a href="/sme" className="btn btn-primary" style={{ width: 'auto', margin: 0 }}>Get Started</a>
